@@ -1,10 +1,12 @@
 from dataclasses import dataclass
+import contextlib
 import math
 from typing import NamedTuple
 
 import torch
 from torch import nn
 from torch.nn import init
+from torch.nn.attention import SDPBackend
 import torch.nn.functional as F
 from einops import rearrange
 
@@ -251,8 +253,8 @@ class Attention(nn.Module):
 
         self.proj_g = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=False)
 
-        self.q_norm = DerfNorm(hidden_size)
-        self.k_norm = DerfNorm(hidden_size)
+        self.q_norm = DerfNorm(head_dim)
+        self.k_norm = DerfNorm(head_dim)
 
         self.proj_out = nn.Linear(
             num_attention_heads * head_dim, hidden_size, bias=False
@@ -301,7 +303,16 @@ class Attention(nn.Module):
                 # b l s -> b 1 l s
                 attention_mask = attention_mask[:, None, :, :]
 
-        features = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+        # We need to use math attention during training
+        # because we are using forward diff mode
+        # when calling jvp
+        needs_math_attention = self.training
+        attention_context_manager = contextlib.nullcontext()
+        if needs_math_attention:
+            attention_context_manager = nn.attention.sdpa_kernel(SDPBackend.MATH)
+
+        with attention_context_manager:
+            features = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
 
         features = features * F.sigmoid(g)
 
@@ -391,7 +402,7 @@ class TimestepEmbedder(nn.Module):
 
 @dataclass
 class ViTDenoiserConfig:
-    input_size: int = 768
+    input_size: int = 48
     hidden_size: int = 256
     head_dim: int = 64
     num_attention_heads: int = 4

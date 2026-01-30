@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from einops import rearrange
 import transformers
 from transformers.modeling_outputs import BaseModelOutputWithNoAttention
+import lpips
 
 
 class DinoV3Encoder(nn.Module):
@@ -187,17 +188,17 @@ class ConvNextV2Loss(nn.Module):
         self.feature_indices = feature_indices
 
     def forward(
-        self, pixel_values_real: torch.Tensor, pixel_values_synth: torch.Tensor
+        self, pixel_values_synth: torch.Tensor, pixel_values_real: torch.Tensor
     ):
         # Expects [B, C, H, W] in (-1,1)
         b, _, h, w = pixel_values_real.shape
 
         crop_params = self.random_resized_crop.get_params(b, h, w)
 
-        pixel_values_real = self.random_resized_crop(pixel_values_real, crop_params)
         pixel_values_synth = self.random_resized_crop(pixel_values_synth, crop_params)
+        pixel_values_real = self.random_resized_crop(pixel_values_real, crop_params)
 
-        pixel_values = torch.cat((pixel_values_real, pixel_values_synth))
+        pixel_values = torch.cat((pixel_values_synth, pixel_values_real))
 
         pixel_values = (pixel_values + 1) / 2
         pixel_values = (pixel_values - self.mean) / self.std
@@ -209,9 +210,33 @@ class ConvNextV2Loss(nn.Module):
             hidden_states = layer_module(hidden_states)
 
             if i in self.feature_indices:
-                hidden_states_real, hidden_states_synth = hidden_states.chunk(2, dim=0)
-                layer_loss = F.mse_loss(hidden_states_real, hidden_states_synth)
+                hidden_states_synth, hidden_states_real = hidden_states.chunk(2, dim=0)
+                layer_loss = F.mse_loss(hidden_states_synth, hidden_states_real)
                 loss += layer_loss / len(self.feature_indices)
+
+        return loss
+
+
+class LPIPSLoss(nn.Module):
+    def __init__(
+        self, crop_scale: tuple[float, float] = (0.3, 1.0), crop_size: int = 224
+    ):
+        super().__init__()
+        self.random_resized_crop = BatchedRandomResizedCrop(crop_size, scale=crop_scale)
+        self.lpips = lpips.LPIPS(net="vgg").requires_grad_(False).eval()
+
+    def forward(
+        self, pixel_values_synth: torch.Tensor, pixel_values_real: torch.Tensor
+    ):
+        # Expects [B, C, H, W] in (-1,1)
+        b, _, h, w = pixel_values_real.shape
+
+        crop_params = self.random_resized_crop.get_params(b, h, w)
+
+        pixel_values_synth = self.random_resized_crop(pixel_values_synth, crop_params)
+        pixel_values_real = self.random_resized_crop(pixel_values_real, crop_params)
+
+        loss = self.lpips(pixel_values_synth, pixel_values_real).mean()
 
         return loss
 
