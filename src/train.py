@@ -151,24 +151,52 @@ def train(conf: MainConfig):
             )
             p["betas"] = conf.betas_adamw
 
-    set_optim_hparams_()
-
     for epoch in range(conf.num_train_epochs):
         for batch in train_loader:
-            pixel_values = batch.pop("pixel_values")
-            pixel_values = (
-                pixel_values.to(conf.device, conf.dtype).div_(255).mul_(2).sub_(1)
-            )
 
-            with torch.autocast(
-                conf.device.type, conf.dtype, enabled=conf.dtype != torch.float32
-            ):
-                loss_dict = flow_helper.compute_meanflow_loss(
-                    x_0=pixel_values,
-                    net=partial(forward_model, model, conf.patch_size),
-                    timesteps_shape=(pixel_values.shape[0], 1, 1, 1),
+            def _step():
+                pixel_values = batch.pop("pixel_values")
+                pixel_values = (
+                    pixel_values.to(conf.device, conf.dtype).div_(255).mul_(2).sub_(1)
                 )
 
-            import bpdb
+                with torch.autocast(conf.device.type, conf.dtype):
+                    meanflow_loss_dict = flow_helper.compute_meanflow_loss(
+                        x_0=pixel_values,
+                        net=partial(forward_model, model, conf.patch_size),
+                        timesteps_shape=(pixel_values.shape[0], 1, 1, 1),
+                    )
 
-            bpdb.set_trace()
+                    x_0_hat = meanflow_loss_dict["x_0_hat"]
+                    x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
+                    pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
+
+                    lpips_loss = lpips_loss_fn(x_0_hat, pixel_values)
+                    convnext_loss = convnext_loss_fn(x_0_hat, pixel_values)
+
+                    total_loss = (
+                        meanflow_loss_dict["loss"].float()
+                        + lpips_loss.float() * conf.lpips_weight
+                        + convnext_loss.float() * conf.convnext_weight
+                    )
+
+                total_loss.backward()
+                set_optim_hparams_()
+                optim_adamw.step()
+                optim_adamw.zero_grad(set_to_none=True)
+                optim_muon.step()
+                optim_muon.zero_grad(set_to_none=True)
+
+                log_dict = {
+                    "loss_meanflow": meanflow_loss_dict["loss"],
+                    "loss_lpips": lpips_loss,
+                    "loss_convnext": convnext_loss,
+                    "loss_total": total_loss,
+                }
+                log_dict = {k: v.detach().cpu().item() for k, v in log_dict.items()}
+
+                return log_dict
+
+            log_dict = _step()
+
+            print(log_dict)

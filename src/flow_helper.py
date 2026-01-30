@@ -54,29 +54,51 @@ class FlowHelper:
         r = self.shift_timesteps(r)
 
         x_1 = torch.randn_like(x_0)
-
         z = (1 - t) * x_0 + t * x_1
 
-        x_0_hat = net(z, r, t)
-        # instantaneous velocity v at time t
-        v = z - x_0_hat / t.clip(self.conf.eps)
+        # Clip t for numerical stability in division
+        t_clipped = t.clip(self.conf.eps)
 
-        # average velocity u from x-prediction
-        def u_fn(z_in, r_in, t_in):
-            return (z_in - net(z_in, r_in, t_in)) / t_in.clip(self.conf.eps)
+        # ------------------------------------------------------------------
+        # 1. Compute u (Average Velocity) at (z, r, t)
+        # We need gradients here for the loss, so this stays outside no_grad.
+        # ------------------------------------------------------------------
+        x_0_hat_r = net(z, r, t)
+        u = (z - x_0_hat_r) / t_clipped
 
-        # predict u and dudt
-        u, dudt = torch.func.jvp(
-            u_fn, (z, r, t), (v, torch.zeros_like(r), torch.ones_like(t))
-        )
+        # ------------------------------------------------------------------
+        # 2. Compute dudt (Correction Term)
+        # Your algo says: V = u + (t-r) * stopgrad(dudt)
+        # We use no_grad() to implement stopgrad AND fix the autocast crash.
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            # Calculate v: Instantaneous velocity at (z, t, t)
+            # Note: We pass 't' as the second argument (r=t) per your algo
+            x_0_hat_t = net(z, t, t)
+            v = (z - x_0_hat_t) / t_clipped
 
-        # compound function V
-        V = u + (t - r) * dudt.detach()
+            # Define the function for JVP
+            def u_fn_jvp(z_in, r_in, t_in):
+                return (z_in - net(z_in, r_in, t_in)) / t_in.clip(self.conf.eps)
 
-        loss_pmf = F.mse_loss(V, x_1 - x_0)
+            # Compute JVP
+            # Primals: (z, r, t)
+            # Tangents: (v, 0, 1) -> v matches z, 0 matches r, 1 matches t
+            _, dudt = torch.func.jvp(
+                u_fn_jvp, (z, r, t), (v, torch.zeros_like(r), torch.ones_like(t))
+            )
+
+        # ------------------------------------------------------------------
+        # 3. Combine
+        # ------------------------------------------------------------------
+        # dudt is already detached because it came from the no_grad block
+        V = u + (t - r) * dudt
+
+        # Target is (e - x) which is equivalent to x_1 - x_0
+        loss = F.mse_loss(V, x_1 - x_0)
 
         return {
-            "loss_pmf": loss_pmf,
-            "x_0_hat": x_0_hat,
+            "loss": loss,
+            "x_0_hat": x_0_hat_r,  # Log the main prediction
             "t": t,
         }

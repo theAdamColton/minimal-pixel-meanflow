@@ -30,6 +30,9 @@ class MainConfig:
     weight_decay_muon: float = 1e-1
     momentum_muon: float = 0.99
 
+    lpips_weight: float = 0.4
+    convnext_weight: float = 0.1
+
     wandb_project_name: str = "minimal-pixel-meanflow"
     wandb_log_every_num_steps: int = 50
     validate_every_num_steps: int = 1000

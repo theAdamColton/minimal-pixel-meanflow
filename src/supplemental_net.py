@@ -107,18 +107,25 @@ class BatchedRandomResizedCrop(torch.nn.Module):
     def forward(self, img_batch: torch.Tensor, params=None):
         B, C, H, W = img_batch.shape
 
+        device, dtype = img_batch.device, img_batch.dtype
+
         if params is None:
             i, j, h, w = self.get_params(B, H, W)
         else:
             i, j, h, w = params
+
+        i = i.to(device)
+        j = j.to(device)
+        h = h.to(device)
+        w = w.to(device)
 
         # Normalize coordinates to [-1, 1] for grid_sample
         # We create a grid for the target size and map it back to the crop regions
         grid_h, grid_w = self.size
 
         # Generate base normalized meshgrid
-        rows = torch.linspace(-1, 1, grid_h, device=img_batch.device)
-        cols = torch.linspace(-1, 1, grid_w, device=img_batch.device)
+        rows = torch.linspace(-1, 1, grid_h, device=device, dtype=dtype)
+        cols = torch.linspace(-1, 1, grid_w, device=device, dtype=dtype)
         mesh_y, mesh_x = torch.meshgrid(
             rows, cols, indexing="ij"
         )  # [target_H, target_W]
@@ -143,6 +150,8 @@ class BatchedRandomResizedCrop(torch.nn.Module):
         grid = torch.stack([final_grid_x, final_grid_y], dim=-1).reshape(
             B, grid_h, grid_w, 2
         )
+
+        grid = grid.to(dtype)
 
         return F.grid_sample(
             img_batch, grid, mode=self.resize_mode, align_corners=False
