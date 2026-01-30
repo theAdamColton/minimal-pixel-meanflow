@@ -220,7 +220,9 @@ class ConvNextV2Loss(nn.Module):
 
             if i in self.feature_indices:
                 hidden_states_synth, hidden_states_real = hidden_states.chunk(2, dim=0)
-                layer_loss = F.mse_loss(hidden_states_synth, hidden_states_real)
+                layer_loss = -F.cosine_similarity(
+                    hidden_states_synth, hidden_states_real
+                ).mean()
                 loss += layer_loss / len(self.feature_indices)
 
         return loss
