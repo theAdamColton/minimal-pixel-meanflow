@@ -1,13 +1,34 @@
-from dataclasses import dataclass
+import math
+import json
+from pathlib import Path
 from functools import partial
+
 from einops import rearrange, repeat
+from tqdm import tqdm
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import datasets
-from torchvision import transforms
+import torchvision
+
 from src.conf import MainConfig
 from src.flow_helper import FlowHelper
 from src.net import ViTDenoiser
 from src.supplemental_net import ConvNextV2Loss, LPIPSLoss
+
+
+def _find_closest_factors(b):
+    # Start searching from the floor of the square root
+    start = int(math.sqrt(b))
+
+    for nh in range(start, 0, -1):
+        if b % nh == 0:
+            nw = b // nh
+            return nh, nw
+    raise ValueError()
 
 
 def _classify_params(model: ViTDenoiser):
@@ -151,52 +172,130 @@ def train(conf: MainConfig):
             )
             p["betas"] = conf.betas_adamw
 
-    for epoch in range(conf.num_train_epochs):
-        for batch in train_loader:
+    output_path = Path("out/")
+    output_path.mkdir(exist_ok=True)
+    run_num = len(list(output_path.iterdir()))
+    run_path = output_path / f"{run_num:05}"
+    run_path.mkdir()
 
-            def _step():
-                pixel_values = batch.pop("pixel_values")
-                pixel_values = (
-                    pixel_values.to(conf.device, conf.dtype).div_(255).mul_(2).sub_(1)
+    input_shape = None
+
+    def _step(batch):
+        pixel_values = batch.pop("pixel_values")
+        pixel_values = (
+            pixel_values.to(conf.device, conf.dtype).div_(255).mul_(2).sub_(1)
+        )
+        nonlocal input_shape
+        input_shape = pixel_values.shape
+
+        with torch.autocast(conf.device.type, conf.dtype):
+            meanflow_loss_dict = flow_helper.compute_meanflow_loss(
+                x_0=pixel_values,
+                net=partial(forward_model, model, conf.patch_size),
+                timesteps_shape=(pixel_values.shape[0], 1, 1, 1),
+            )
+
+            x_0_hat = meanflow_loss_dict["x_0_hat"]
+            x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
+            pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
+
+            lpips_loss = lpips_loss_fn(x_0_hat, pixel_values)
+            convnext_loss = convnext_loss_fn(x_0_hat, pixel_values)
+
+            total_loss = (
+                meanflow_loss_dict["loss"].float()
+                + lpips_loss.float() * conf.lpips_weight
+                + convnext_loss.float() * conf.convnext_weight
+            )
+
+        total_loss.backward()
+        set_optim_hparams_()
+        optim_adamw.step()
+        optim_adamw.zero_grad(set_to_none=True)
+        optim_muon.step()
+        optim_muon.zero_grad(set_to_none=True)
+
+        with torch.no_grad():
+            for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+                ema_p.lerp_(p, 1 - conf.ema_beta)
+
+        log_dict = {
+            "loss_meanflow": meanflow_loss_dict["loss"],
+            "loss_lpips": lpips_loss,
+            "loss_convnext": convnext_loss,
+            "loss_total": total_loss,
+        }
+        log_dict = {k: v.detach().cpu().item() for k, v in log_dict.items()}
+
+        return log_dict
+
+    if conf.should_compile:
+        _step = torch.compile(_step)
+
+    for epoch in range(conf.num_train_epochs):
+        for batch in tqdm(train_loader):
+            log_dict = _step(batch)
+
+            log_dict["epoch"] = epoch
+            log_dict["global_step"] = global_step
+
+            @torch.inference_mode()
+            def _validate():
+                torch_rng = torch.Generator(conf.device)
+                x_1 = torch.randn(*input_shape, device=conf.device, dtype=conf.dtype)
+                r = torch.zeros(input_shape[0], device=conf.device)
+                t = torch.ones(input_shape[0], device=conf.device)
+                with torch.autocast(conf.device.type, conf.dtype):
+                    x_0 = forward_model(
+                        model, patch_size=conf.patch_size, x_t=x_1, r=r, t=t
+                    )
+                x_0 = (
+                    x_0.float()
+                    .add(1)
+                    .div(2)
+                    .clip(0, 1)
+                    .mul(255)
+                    .round()
+                    .to(torch.uint8)
+                    .cpu()
                 )
 
-                with torch.autocast(conf.device.type, conf.dtype):
-                    meanflow_loss_dict = flow_helper.compute_meanflow_loss(
-                        x_0=pixel_values,
-                        net=partial(forward_model, model, conf.patch_size),
-                        timesteps_shape=(pixel_values.shape[0], 1, 1, 1),
-                    )
+                pad_amount = 2
+                h_padding = torch.zeros(
+                    x_0.shape[0],
+                    pad_amount,
+                    x_0.shape[2],
+                    x_0.shape[3],
+                    dtype=torch.uint8,
+                )
+                x_0 = torch.cat((x_0, h_padding), 1)
+                w_padding = torch.zeros(
+                    x_0.shape[0],
+                    x_0.shape[1],
+                    pad_amount,
+                    x_0.shape[3],
+                    dtype=torch.uint8,
+                )
+                x_0 = torch.cat((x_0, w_padding), 2)
 
-                    x_0_hat = meanflow_loss_dict["x_0_hat"]
-                    x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
-                    pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
+                b = input_shape[0]
+                nh, nw = _find_closest_factors(b)
+                x_0 = rearrange(x_0, "(nh nw) h w c -> c (nh h) (nw w)", nh=nh, nw=nw)
+                x_0 = x_0[:, :-pad_amount, :-pad_amount]
+                torchvision.io.write_png(x_0, str(run_path / f"{global_step:06}.png"))
 
-                    lpips_loss = lpips_loss_fn(x_0_hat, pixel_values)
-                    convnext_loss = convnext_loss_fn(x_0_hat, pixel_values)
+            should_validate = global_step % conf.validate_every_num_steps == 0
+            if should_validate:
+                _validate()
 
-                    total_loss = (
-                        meanflow_loss_dict["loss"].float()
-                        + lpips_loss.float() * conf.lpips_weight
-                        + convnext_loss.float() * conf.convnext_weight
-                    )
+            with open(run_path / "log.jsonl", "a") as f:
+                f.write(json.dumps(log_dict) + "\n")
 
-                total_loss.backward()
-                set_optim_hparams_()
-                optim_adamw.step()
-                optim_adamw.zero_grad(set_to_none=True)
-                optim_muon.step()
-                optim_muon.zero_grad(set_to_none=True)
+            if should_validate:
+                d = pd.read_json(run_path / "log.jsonl", lines=True)
+                if len(d) > 1:
+                    plt.plot(d["global_step"], d["loss_total"])
+                    plt.savefig(run_path / "total_loss.png")
+                    plt.close()
 
-                log_dict = {
-                    "loss_meanflow": meanflow_loss_dict["loss"],
-                    "loss_lpips": lpips_loss,
-                    "loss_convnext": convnext_loss,
-                    "loss_total": total_loss,
-                }
-                log_dict = {k: v.detach().cpu().item() for k, v in log_dict.items()}
-
-                return log_dict
-
-            log_dict = _step()
-
-            print(log_dict)
+            global_step += 1

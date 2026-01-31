@@ -22,9 +22,9 @@ class MainConfig:
 
     ema_beta: float = 0.9995
 
-    num_warmup_steps: int = 10000
-    lr_muon: float = 1e-4
-    lr_adamw: float = 5e-5
+    num_warmup_steps: int = 1000
+    lr_muon: float = 5e-4
+    lr_adamw: float = 1e-4
     betas_adamw: tuple[float, float] = (0.9, 0.999)
     weight_decay_adamw: float = 1e-2
     weight_decay_muon: float = 1e-1
@@ -35,7 +35,9 @@ class MainConfig:
 
     wandb_project_name: str = "minimal-pixel-meanflow"
     wandb_log_every_num_steps: int = 50
-    validate_every_num_steps: int = 1000
+    validate_every_num_steps: int = 200
+
+    should_compile: bool = False
 
     device_str: str = "cuda"
     dtype_str: str = "bfloat16"
