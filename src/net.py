@@ -219,25 +219,6 @@ class MLP(nn.Module):
         return x
 
 
-class ResidualMLP(nn.Module):
-    def __init__(
-        self, hidden_size: int = 256, use_bias: bool = False, num_blocks: int = 4
-    ):
-        super().__init__()
-
-        self.blocks = nn.ModuleList(
-            nn.Sequential(nn.RMSNorm(hidden_size), MLP(hidden_size, use_bias))
-            for _ in range(num_blocks)
-        )
-        self.norm_out = nn.LayerNorm(hidden_size)
-
-    def forward(self, x):
-        for block in self.blocks:
-            x = x + block(x)
-        x = self.norm_out(x)
-        return x
-
-
 class Attention(nn.Module):
     def __init__(
         self,
@@ -278,15 +259,13 @@ class Attention(nn.Module):
         g = self.proj_g(features)
 
         # ... (h dh) -> ... h dh
-        q, k, v = (
-            t.reshape(b, -1, self.num_attention_heads, self.head_dim) for t in (q, k, v)
+        q, k, v, g = (
+            t.reshape(b, -1, self.num_attention_heads, self.head_dim)
+            for t in (q, k, v, g)
         )
-        g = g.reshape(b, -1, self.num_attention_heads, self.head_dim)
 
         # b s h dh -> b h s dh
-        q, k, v = (t.transpose(2, 1) for t in (q, k, v))
-        if g is not None:
-            g = g.transpose(2, 1)
+        q, k, v, g = (t.transpose(2, 1) for t in (q, k, v, g))
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -407,7 +386,7 @@ class ViTDenoiserConfig:
     head_dim: int = 64
     num_attention_heads: int = 4
     num_blocks: int = 8
-    should_pin_adaln: bool = True
+    should_pin_adaln: bool = False
 
 
 class ViTDenoiserOutput(NamedTuple):

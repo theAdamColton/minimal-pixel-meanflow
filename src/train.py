@@ -20,6 +20,10 @@ from src.net import ViTDenoiser
 from src.supplemental_net import ConvNextV2Loss, LPIPSLoss
 
 
+def _lerp(a, b, p):
+    return (b - a) * p + a
+
+
 def _find_closest_factors(b):
     # Start searching from the floor of the square root
     start = int(math.sqrt(b))
@@ -38,9 +42,9 @@ def _classify_params(model: ViTDenoiser):
 
     for name, parameter in model.named_parameters():
         is_hidden = "blocks." in name
-        is_multidim = parameter.ndim == 2
+        is_2d = parameter.ndim == 2
 
-        if not is_multidim:
+        if not is_2d:
             biases.append(parameter)
         elif is_hidden:
             hidden_weights.append(parameter)
@@ -154,27 +158,12 @@ def train(conf: MainConfig):
     model = model.to(conf.device)
     ema_model = ema_model.to(conf.device).requires_grad_(False)
 
-    adamw_params, muon_params = _classify_params(model)
+    adamw_p_groups, muon_p_groups = _classify_params(model)
 
-    optim_muon = torch.optim.Muon(muon_params)
-    optim_adamw = torch.optim.AdamW(adamw_params)
+    # optim_muon = torch.optim.Muon(muon_p_groups, adjust_lr_fn="match_rms_adamw")
+    optim_adamw = torch.optim.AdamW(adamw_p_groups + muon_p_groups)
 
     global_step = 0
-
-    def set_optim_hparams_():
-        warmup_p = min(global_step / conf.num_warmup_steps, 1.0)
-
-        for p in optim_muon.param_groups:
-            p["lr"] = conf.lr_muon * warmup_p
-            p["weight_decay"] = conf.weight_decay_muon
-            p["momentum"] = conf.momentum_muon
-
-        for p in optim_adamw.param_groups:
-            p["lr"] = conf.lr_adamw * warmup_p
-            p["weight_decay"] = (
-                conf.weight_decay_adamw if p["use_weight_decay"] else 0.0
-            )
-            p["betas"] = conf.betas_adamw
 
     output_path = Path("out/")
     output_path.mkdir(exist_ok=True)
@@ -192,16 +181,18 @@ def train(conf: MainConfig):
         nonlocal input_shape
         input_shape = pixel_values.shape
 
-        with torch.autocast(conf.device.type, conf.dtype):
-            meanflow_loss_dict = flow_helper.compute_meanflow_loss(
+        with torch.autocast(
+            conf.device.type, conf.dtype, enabled=conf.dtype != torch.float32
+        ):
+            loss_dict, extra_dict = flow_helper.compute_meanflow_loss(
                 x_0=pixel_values,
                 net=partial(forward_model, model, conf.patch_size),
                 timesteps_shape=(pixel_values.shape[0], 1, 1, 1),
             )
 
-            x_0_hat = meanflow_loss_dict["x_0_hat"]
-            x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
-            pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
+            # x_0_hat = extra_dict["x_0_hat"]
+            # x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
+            # pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
 
             lpips_loss = 0.0
             if conf.lpips_weight > 0.0:
@@ -211,27 +202,48 @@ def train(conf: MainConfig):
                 convnext_loss = convnext_loss_fn(x_0_hat, pixel_values)
 
             total_loss = (
-                meanflow_loss_dict["loss"]
+                loss_dict["loss"]
                 + lpips_loss * conf.lpips_weight
                 + convnext_loss * conf.convnext_weight
             )
 
         total_loss.backward()
-        set_optim_hparams_()
-        optim_adamw.step()
-        optim_adamw.zero_grad(set_to_none=True)
-        optim_muon.step()
-        optim_muon.zero_grad(set_to_none=True)
 
+        for p_group in adamw_p_groups, muon_p_groups:
+            for parameters in p_group:
+                torch.nn.utils.clip_grad_norm_(parameters["params"], max_norm=1.0)
+
+        warmup_p = _lerp(0.1, 1.0, min(global_step / conf.num_warmup_steps, 1.0))
+
+        # for p in optim_muon.param_groups:
+        #     p["lr"] = conf.lr_muon * warmup_p
+        #     p["weight_decay"] = conf.weight_decay_muon
+        #     p["momentum"] = conf.momentum_muon
+
+        lr_adamw = conf.lr_adamw * warmup_p
+        for p in optim_adamw.param_groups:
+            p["lr"] = lr_adamw
+            p["weight_decay"] = (
+                conf.weight_decay_adamw if p["use_weight_decay"] else 0.0
+            )
+            p["betas"] = conf.betas_adamw
+
+        optim_adamw.step()
+        # optim_muon.step()
+        optim_adamw.zero_grad(set_to_none=True)
+        # optim_muon.zero_grad(set_to_none=True)
+
+        ema_beta = warmup_p * conf.ema_beta
         with torch.no_grad():
             for ema_p, p in zip(ema_model.parameters(), model.parameters()):
-                ema_p.lerp_(p, 1 - conf.ema_beta)
+                ema_p.lerp_(p, 1 - ema_beta)
 
         log_dict = {
-            "loss_meanflow": meanflow_loss_dict["loss"],
+            **loss_dict,
             "loss_lpips": lpips_loss,
             "loss_convnext": convnext_loss,
             "loss_total": total_loss,
+            "lr_adamw": lr_adamw,
         }
 
         return log_dict
@@ -258,7 +270,7 @@ def train(conf: MainConfig):
                 t = torch.ones(input_shape[0], device=conf.device)
                 with torch.autocast(conf.device.type, conf.dtype):
                     x_0 = forward_model(
-                        model, patch_size=conf.patch_size, x_t=x_1, r=r, t=t
+                        ema_model, patch_size=conf.patch_size, x_t=x_1, r=r, t=t
                     )
                 x_0 = (
                     x_0.float()
@@ -304,8 +316,16 @@ def train(conf: MainConfig):
 
             if should_validate:
                 d = pd.read_json(run_path / "log.jsonl", lines=True)
+                d["loss_total_smoothed"] = (
+                    d["loss_total"].ewm(adjust=False, alpha=0.005).mean()
+                )
                 if len(d) > 1:
-                    plt.plot(d["global_step"], d["loss_total"])
+                    plt.plot(d["global_step"], d["loss_total_smoothed"])
+                    plt.plot(d["global_step"], d["loss_total"], alpha=0.1)
+                    plt.ylim(
+                        d["loss_total"].min(),
+                        d["loss_total_smoothed"].quantile(0.9),
+                    )
                     plt.savefig(run_path / "total_loss.png")
                     plt.close()
 
