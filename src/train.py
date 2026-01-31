@@ -142,8 +142,12 @@ def train(conf: MainConfig):
     ema_model = ViTDenoiser(conf.model)
     ema_model.load_state_dict(model.state_dict())
 
-    lpips_loss_fn = LPIPSLoss().to(conf.device, conf.dtype)
-    convnext_loss_fn = ConvNextV2Loss().to(conf.device, conf.dtype)
+    lpips_loss_fn = None
+    if conf.lpips_weight > 0:
+        lpips_loss_fn = LPIPSLoss().to(conf.device, conf.dtype)
+    convnext_loss_fn = None
+    if conf.convnext_weight > 0:
+        convnext_loss_fn = ConvNextV2Loss().to(conf.device, conf.dtype)
 
     flow_helper = FlowHelper(conf.flow)
 
@@ -199,13 +203,17 @@ def train(conf: MainConfig):
             x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
             pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
 
-            lpips_loss = lpips_loss_fn(x_0_hat, pixel_values)
-            convnext_loss = convnext_loss_fn(x_0_hat, pixel_values)
+            lpips_loss = 0.0
+            if conf.lpips_weight > 0.0:
+                lpips_loss = lpips_loss_fn(x_0_hat, pixel_values)
+            convnext_loss = 0.0
+            if conf.convnext_weight > 0.0:
+                convnext_loss = convnext_loss_fn(x_0_hat, pixel_values)
 
             total_loss = (
-                meanflow_loss_dict["loss"].float()
-                + lpips_loss.float() * conf.lpips_weight
-                + convnext_loss.float() * conf.convnext_weight
+                meanflow_loss_dict["loss"]
+                + lpips_loss * conf.lpips_weight
+                + convnext_loss * conf.convnext_weight
             )
 
         total_loss.backward()
@@ -225,7 +233,6 @@ def train(conf: MainConfig):
             "loss_convnext": convnext_loss,
             "loss_total": total_loss,
         }
-        log_dict = {k: v.detach().cpu().item() for k, v in log_dict.items()}
 
         return log_dict
 
@@ -235,6 +242,10 @@ def train(conf: MainConfig):
     for epoch in range(conf.num_train_epochs):
         for batch in tqdm(train_loader):
             log_dict = _step(batch)
+            log_dict = {
+                k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else v
+                for k, v in log_dict.items()
+            }
 
             log_dict["epoch"] = epoch
             log_dict["global_step"] = global_step
