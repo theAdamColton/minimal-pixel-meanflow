@@ -76,7 +76,7 @@ class FlowHelper:
 
         x_t = x_1
 
-        for i in range(num_steps - 1):
+        for i in range(num_steps):
             t_curr = t[i]
             t_next = t[i + 1]
             dt = t_next - t_curr

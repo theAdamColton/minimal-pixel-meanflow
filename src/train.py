@@ -160,8 +160,8 @@ def train(conf: MainConfig):
 
     adamw_p_groups, muon_p_groups = _classify_params(model)
 
-    # optim_muon = torch.optim.Muon(muon_p_groups, adjust_lr_fn="match_rms_adamw")
-    optim_adamw = torch.optim.AdamW(adamw_p_groups + muon_p_groups)
+    optim_muon = torch.optim.Muon(muon_p_groups, adjust_lr_fn="match_rms_adamw")
+    optim_adamw = torch.optim.AdamW(adamw_p_groups)
 
     global_step = 0
 
@@ -209,16 +209,18 @@ def train(conf: MainConfig):
 
         total_loss.backward()
 
-        for p_group in adamw_p_groups, muon_p_groups:
-            for parameters in p_group:
-                torch.nn.utils.clip_grad_norm_(parameters["params"], max_norm=1.0)
+        # Step optimizers
+
+        for p_group in adamw_p_groups + muon_p_groups:
+            torch.nn.utils.clip_grad_norm_(p_group["params"], max_norm=1.0)
 
         warmup_p = _lerp(0.1, 1.0, min(global_step / conf.num_warmup_steps, 1.0))
 
-        # for p in optim_muon.param_groups:
-        #     p["lr"] = conf.lr_muon * warmup_p
-        #     p["weight_decay"] = conf.weight_decay_muon
-        #     p["momentum"] = conf.momentum_muon
+        lr_muon = conf.lr_muon * warmup_p
+        for p in optim_muon.param_groups:
+            p["lr"] = lr_muon
+            p["weight_decay"] = conf.weight_decay_muon
+            p["momentum"] = conf.momentum_muon
 
         lr_adamw = conf.lr_adamw * warmup_p
         for p in optim_adamw.param_groups:
@@ -229,10 +231,11 @@ def train(conf: MainConfig):
             p["betas"] = conf.betas_adamw
 
         optim_adamw.step()
-        # optim_muon.step()
+        optim_muon.step()
         optim_adamw.zero_grad(set_to_none=True)
-        # optim_muon.zero_grad(set_to_none=True)
+        optim_muon.zero_grad(set_to_none=True)
 
+        # Update ema model
         ema_beta = warmup_p * conf.ema_beta
         with torch.no_grad():
             for ema_p, p in zip(ema_model.parameters(), model.parameters()):
@@ -244,6 +247,7 @@ def train(conf: MainConfig):
             "loss_convnext": convnext_loss,
             "loss_total": total_loss,
             "lr_adamw": lr_adamw,
+            "lr_muon": lr_muon,
         }
 
         return log_dict
