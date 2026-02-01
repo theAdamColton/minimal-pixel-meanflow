@@ -23,8 +23,8 @@ class MainConfig:
     ema_beta: float = 0.999
 
     num_warmup_steps: int = 40000
-    lr_muon: float = 1e-4
-    lr_adamw: float = 1e-4
+    lr_muon: float = 5e-3
+    lr_adamw: float = 1e-3
     betas_adamw: tuple[float, float] = (0.9, 0.997)
     weight_decay_adamw: float = 1e-2
     weight_decay_muon: float = 1e-2

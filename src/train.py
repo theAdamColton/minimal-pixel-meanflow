@@ -94,8 +94,8 @@ def forward_model(
         pw=patch_size,
     )
 
-    r = r.squeeze()[:, None]
-    t = t.squeeze()[:, None]
+    r = r.squeeze().unsqueeze(-1)
+    t = t.squeeze().unsqueeze(-1)
 
     output = model(
         patches=patches, terminal_timesteps=r, timesteps=t, patch_coords=patch_coords
