@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import math
-from typing import Callable
+from typing import Callable, Literal
 import torch
 import torch.nn.functional as F
 
@@ -9,15 +9,13 @@ import torch.nn.functional as F
 class FlowHelperConfig:
     time_shift_dim: float = 12288
     time_shift_base: float = 4096
-    eps: float = 0.05
+    eps: float = 0.2
+    prediction_mode: Literal["clean_input", "velocity"] = "clean_input"
 
 
 class FlowHelper:
     """
     Flow from noise (t=1.0) to data (t=0.0)
-
-    using a x-prediction network
-    and shifted timesteps
     """
 
     def __init__(self, conf: FlowHelperConfig = FlowHelperConfig()):
@@ -33,6 +31,39 @@ class FlowHelper:
         # Shifts timesteps to be larger (assuming shift > 1)
         t = 1 - (1 - t) / (1 - t + shift * t)
         return t
+
+    def compute_u(self, net, z, r, t):
+        out = net(z, r, t)
+        if self.conf.prediction_mode == "clean_input":
+            # Convert x_0 prediction into velocity/u prediction
+            u = (z - out) / t.clip(self.conf.eps)
+        elif self.conf.prediction_mode == "velocity":
+            u = out
+        else:
+            raise ValueError(self.conf.prediction_mode)
+
+        return u
+
+    def sample_euler(
+        self,
+        net: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        x_1: torch.Tensor,
+        num_steps: int = 4,
+    ):
+        device = x_1.device
+        t_0, t_1 = self._get_timestep_interval()
+        t = torch.linspace(t_0, t_1, num_steps + 1, device=device)
+        dt = t[1:] - t[:-1]
+        r = t[1:]
+
+        x_t = x_1
+
+        for t, dt, r in zip(t, dt, r):
+            u = self.compute_u(net, x_t, r, t)
+            x_t = x_t - u * dt
+
+        x_0 = x_t
+        return x_0
 
     def compute_flow_matching_loss(
         self,
@@ -72,11 +103,11 @@ class FlowHelper:
         x_1 = torch.randn_like(x_0)
         z = (1 - t) * x_0 + t * x_1
 
-        def u_fn(z_in, r_in, t_in):
-            return (z_in - net(z_in, r_in, t_in)) / t_in.clip(self.conf.eps)
-
         # Predict the instantaneous velocity
-        v = u_fn(z, t, t)
+        v = self.compute_u(net, z, t, t)
+
+        def u_fn(z_in, r_in, t_in):
+            return self.compute_u(net, z_in, r_in, t_in)
 
         # Mean flow
         u, dudt = torch.func.jvp(

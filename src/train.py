@@ -266,12 +266,13 @@ def train(conf: MainConfig):
             def _validate():
                 torch_rng = torch.Generator(conf.device)
                 x_1 = torch.randn(*input_shape, device=conf.device, dtype=conf.dtype)
-                r = torch.zeros(input_shape[0], device=conf.device)
-                t = torch.ones(input_shape[0], device=conf.device)
                 with torch.autocast(conf.device.type, conf.dtype):
-                    x_0 = forward_model(
-                        ema_model, patch_size=conf.patch_size, x_t=x_1, r=r, t=t
+                    x_0 = flow_helper.sample_euler(
+                        partial(forward_model, ema_model, conf.patch_size),
+                        x_1=x_1,
+                        num_steps=1,
                     )
+
                 x_0 = (
                     x_0.float()
                     .add(1)
