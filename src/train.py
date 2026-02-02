@@ -283,9 +283,8 @@ class Trainer:
             .sub_(1.0)
         )
 
-        # Store input shape for validation (first batch)
-        if self.input_shape is None:
-            self.input_shape = pixel_values.shape
+        # Store input shape for validation
+        self.input_shape = pixel_values.shape
 
         loss_dict, extra_dict = self.flow_helper.compute_meanflow_loss(
             x_0=pixel_values,
@@ -492,7 +491,6 @@ class Trainer:
                 log_dict["epoch"] = epoch
                 log_dict["global_step"] = self.global_step
 
-                # Validation
                 should_validate = (
                     self.global_step % self.conf.validate_every_num_steps == 0
                 )
@@ -500,7 +498,6 @@ class Trainer:
                     self._validate_and_log()
                     self._maybe_plot_losses()
 
-                # Checkpointing
                 should_save = self.global_step % self.conf.save_every_num_steps == 0
                 if should_save:
                     self._save_checkpoint()
@@ -509,10 +506,9 @@ class Trainer:
                 with open(self.log_path, "a") as f:
                     f.write(json.dumps(log_dict) + "\n")
 
-                # WandB logging
                 should_log_wandb = (
                     self.global_step % self.conf.wandb_log_every_num_steps == 0
-                )
+                ) or should_validate
                 if should_log_wandb and self.wandb_run:
                     wandb.log(log_dict, step=self.global_step)
 

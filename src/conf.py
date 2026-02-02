@@ -41,7 +41,7 @@ class MainConfig:
 
     perceptual_loss_proportion: float = 0.5
 
-    should_compile: bool = False
+    should_compile: bool = True
 
     device_str: str = "cuda"
     dtype_str: str = "bfloat16"
