@@ -99,9 +99,11 @@ class FlowHelper:
         timesteps_shape: tuple,
         torch_rng: torch.Generator | None = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        device = x_0.device
+        device, dtype = x_0.device, x_0.dtype
 
-        tr = torch.rand(*timesteps_shape, 2, generator=torch_rng, device=device)
+        tr = torch.rand(
+            *timesteps_shape, 2, generator=torch_rng, device=device, dtype=dtype
+        )
         tr = self.shift_timesteps(tr)
 
         t = tr.amax(dim=-1)
@@ -153,11 +155,13 @@ class FlowHelper:
 
         total_loss = loss_u + loss_v
 
+        x_0_hat = z - u * (t - r)
+
         return (
             {
                 "loss": total_loss,
                 "loss_mf": loss_u,
                 "loss_fm": loss_v,
             },
-            {"x_0_hat": None},
+            {"x_0_hat": x_0_hat, "r": r, "t": t},
         )

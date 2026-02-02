@@ -164,6 +164,7 @@ class ConvNextV2Loss(nn.Module):
         path_or_url: str = "facebook/convnextv2-base-22k-224",
         feature_indices: list[int] | None = None,
         crop_scale: tuple[float, float] = (0.3, 1.0),
+        crop_size: tuple[int, int] | None = None,
     ):
         super().__init__()
 
@@ -181,7 +182,10 @@ class ConvNextV2Loss(nn.Module):
             persistent=False,
         )
 
-        self.crop_size = self.preprocessor.size["shortest_edge"]
+        if crop_size is not None:
+            self.crop_size = crop_size
+        else:
+            self.crop_size = self.preprocessor.size["shortest_edge"]
         self.random_resized_crop = BatchedRandomResizedCrop(
             self.crop_size, scale=crop_scale
         )

@@ -385,8 +385,8 @@ class ViTDenoiserConfig:
     hidden_size: int = 256
     head_dim: int = 64
     num_attention_heads: int = 4
-    num_blocks: int = 8
-    should_pin_adaln: bool = False
+    num_blocks: int = 12
+    should_pin_adaln: bool = True
 
 
 class ViTDenoiserOutput(NamedTuple):

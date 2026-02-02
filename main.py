@@ -1,7 +1,7 @@
 import jsonargparse
 
 from src.conf import MainConfig
-from src.train import train
+from src.train import Trainer
 
 
 class Main:
@@ -9,7 +9,8 @@ class Main:
         self.conf = conf
 
     def train(self):
-        train(self.conf)
+        trainer = Trainer(self.conf)
+        trainer.train()
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+wandb/
 out/
 # Python-generated files
 __pycache__/

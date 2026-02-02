@@ -20,11 +20,11 @@ class MainConfig:
 
     num_train_epochs: int = 1000
 
-    ema_beta: float = 0.999
+    ema_beta: float = 0.9995
 
     num_warmup_steps: int = 40000
-    lr_muon: float = 1e-3
-    lr_adamw: float = 1e-4
+    lr_muon: float = 3e-3
+    lr_adamw: float = 5e-4
     betas_adamw: tuple[float, float] = (0.9, 0.997)
     weight_decay_adamw: float = 1e-2
     weight_decay_muon: float = 1e-2
@@ -35,7 +35,11 @@ class MainConfig:
 
     wandb_project_name: str = "minimal-pixel-meanflow"
     wandb_log_every_num_steps: int = 50
-    validate_every_num_steps: int = 200
+    validate_every_num_steps: int = 500
+    save_every_num_steps: int = 500
+    max_num_checkpoints: int = 5
+
+    perceptual_loss_proportion: float = 0.5
 
     should_compile: bool = False
 
