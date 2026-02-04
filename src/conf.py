@@ -13,9 +13,9 @@ class MainConfig:
     flow: FlowHelperConfig = field(default_factory=FlowHelperConfig)
 
     dataset_path_or_url: str = "benjamin-paine/imagenet-1k-64x64"
-    patch_size: int = 4
+    patch_size: int = 8
 
-    batch_size: int = 64
+    batch_size: int = 256
     num_workers: int = 4
 
     num_train_epochs: int = 1000
@@ -23,8 +23,8 @@ class MainConfig:
     ema_beta: float = 0.9995
 
     num_warmup_steps: int = 40000
-    lr_muon: float = 3e-3
-    lr_adamw: float = 5e-4
+    lr_muon: float = 1e-3
+    lr_adamw: float = 1e-4
     betas_adamw: tuple[float, float] = (0.9, 0.997)
     weight_decay_adamw: float = 1e-2
     weight_decay_muon: float = 1e-2

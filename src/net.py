@@ -381,7 +381,7 @@ class TimestepEmbedder(nn.Module):
 
 @dataclass
 class ViTDenoiserConfig:
-    input_size: int = 48
+    input_size: int = 192
     hidden_size: int = 256
     head_dim: int = 64
     num_attention_heads: int = 4
