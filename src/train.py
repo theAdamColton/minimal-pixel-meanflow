@@ -17,13 +17,19 @@ import torchvision
 import wandb
 from einops import rearrange, repeat
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from tqdm import tqdm
 
 import datasets
 from src.conf import MainConfig
 from src.flow_helper import FlowHelper
-from src.net import ViTDenoiser
-from src.supplemental_net import ConvNextV2Loss, LPIPSLoss
+from src.net import ViTDenoiser, ViTDenoiserOutput
+from src.supplemental_net import (
+    ConvNextV2Loss,
+    LPIPSLoss,
+    DinoV3Encoder,
+    REPAProjector2D,
+)
 
 
 def _lerp(a: float, b: float, p: float) -> float:
@@ -149,11 +155,20 @@ class Trainer:
 
     def _setup_models(self) -> None:
         """Initialize models, EMA, and loss functions."""
+
         self.model = ViTDenoiser(self.conf.model).to(self.conf.device)
+        self.repa_projector = REPAProjector2D(
+            in_channels=self.conf.model.hidden_size,
+            out_channels=self.conf.repa_output_size,
+        ).to(self.conf.device)
 
         self.ema_model = ViTDenoiser(self.conf.model).to(self.conf.device)
         self.ema_model.load_state_dict(self.model.state_dict())
         self.ema_model.requires_grad_(False)
+
+        self.dinov3_encoder = None
+        if self.conf.repa_weight > 0:
+            self.dinov3_encoder = DinoV3Encoder().to(self.conf.device, self.conf.dtype)
 
         self.lpips_loss_fn = None
         if self.conf.lpips_weight > 0:
@@ -184,6 +199,10 @@ class Trainer:
             else:
                 nonhidden_weights.append(parameter)
 
+        nonhidden_weights.append(self.repa_projector.conv.weight)
+        if self.repa_projector.conv.bias is not None:
+            biases.append(self.repa_projector.conv.bias)
+
         adamw_groups = [
             {"params": nonhidden_weights, "use_weight_decay": True},
             {"params": biases, "use_weight_decay": False},
@@ -197,7 +216,8 @@ class Trainer:
     def _setup_optimizers(self) -> None:
         """Initialize AdamW and Muon optimizers."""
         adamw_groups, muon_groups = self._classify_params()
-        self.adamw_groups = adamw_groups  # Store for grad clipping
+
+        self.adamw_groups = adamw_groups
         self.muon_groups = muon_groups
 
         self.optim_muon = torch.optim.Muon(muon_groups, adjust_lr_fn="match_rms_adamw")
@@ -220,7 +240,8 @@ class Trainer:
         x_t: torch.Tensor,
         r: torch.Tensor,
         t: torch.Tensor,
-    ) -> torch.Tensor:
+        return_layer_indices=None,
+    ):
         """Forward pass through the model handling patching/unpatching."""
         b, h, w, c = x_t.shape
         device, dtype = x_t.device, x_t.dtype
@@ -253,11 +274,12 @@ class Trainer:
             self.conf.dtype,
             enabled=patches.dtype != torch.float32,
         ):
-            output = model(
+            output: ViTDenoiserOutput = model(
                 patches=patches,
                 terminal_timesteps=r,
                 timesteps=t,
                 patch_coords=patch_coords,
+                return_layer_indices=return_layer_indices,
             )
 
         # Unpatchify output
@@ -272,10 +294,57 @@ class Trainer:
             pw=self.conf.patch_size,
         )
 
-        return x_0_hat.float()
+        return x_0_hat.float(), {"layer_hidden_states": output.layer_hidden_states}
+
+    @torch.no_grad()
+    def _extract_repa_teacher_hidden_states(self, pixel_values: torch.Tensor):
+        pixel_values = pixel_values.to(self.conf.dtype)
+        _, h, w, _ = pixel_values.shape
+
+        _, teacher_hidden_states = self.dinov3_encoder(pixel_values)
+
+        teacher_hidden_states = rearrange(
+            teacher_hidden_states,
+            "b (nph npw) d -> b d nph npw",
+            nph=h // self.dinov3_encoder.patch_size,
+            npw=w // self.dinov3_encoder.patch_size,
+        )
+
+        # Handle differing patch sizes between model and dinov3
+        dino_patch_factor = self.conf.patch_size / self.dinov3_encoder.patch_size
+        # Mean pool if dino patch size is smaller
+        if dino_patch_factor > 1:
+            teacher_hidden_states = F.avg_pool2d(
+                teacher_hidden_states,
+                kernel_size=int(dino_patch_factor),
+                stride=int(dino_patch_factor),
+            )
+
+        # Repeat (Nearest exact upsample) if dino patch size is bigger
+        if dino_patch_factor < 0:
+            repeat_factor = int(1 / dino_patch_factor)
+            teacher_hidden_states = repeat(
+                teacher_hidden_states,
+                "b d nph npw -> b d (nph r_h) (npw r_w)",
+                r_h=repeat_factor,
+                r_w=repeat_factor,
+            )
+
+        # Spatial normalization
+        mean = teacher_hidden_states.mean(dim=(2, 3), keepdim=True)
+        std = teacher_hidden_states.std(dim=(2, 3), keepdim=True)
+        teacher_hidden_states = (teacher_hidden_states - mean) / std
+
+        return teacher_hidden_states.float()
 
     def _compute_losses(self, batch: dict[str, Any]):
         pixel_values = batch.pop("pixel_values")
+
+        _, h, w, _ = pixel_values.shape
+
+        nph = h // self.conf.patch_size
+        npw = w // self.conf.patch_size
+
         pixel_values = (
             pixel_values.to(self.conf.device, torch.float32)
             .div_(255.0)
@@ -288,28 +357,69 @@ class Trainer:
 
         loss_dict, extra_dict = self.flow_helper.compute_meanflow_loss(
             x_0=pixel_values,
-            net=partial(self._forward_model, self.model),
+            net=partial(
+                self._forward_model,
+                self.model,
+                return_layer_indices=[self.conf.repa_depth],
+            ),
             timesteps_shape=(pixel_values.shape[0], 1, 1, 1),
         )
 
         x_0_hat = extra_dict["x_0_hat"]
         timesteps = extra_dict["t"]
-        x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
-        pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
 
         with torch.autocast(
             self.conf.device.type,
             self.conf.dtype,
             enabled=self.conf.dtype != torch.float32,
         ):
+            repa_loss = 0.0
+            if self.conf.repa_weight > 0.0 and self.dinov3_encoder is not None:
+                # Hidden states extracted from the nth layer when computing the
+                # instantaneous velocity
+                hidden_states = extra_dict["layer_hidden_states"].squeeze(0)
+                hidden_states = rearrange(
+                    hidden_states, "b (nph npw) d -> b d nph npw", nph=nph, npw=npw
+                )
+                projected_hidden_states = self.repa_projector(hidden_states)
+
+                teacher_hidden_states = self._extract_repa_teacher_hidden_states(
+                    pixel_values
+                )
+
+                repa_loss = -F.cosine_similarity(
+                    projected_hidden_states, teacher_hidden_states, dim=1
+                ).mean()
+
+            x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
+            pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
+
             # indices of the least noisy samples
             indices = timesteps.squeeze().argsort(descending=False)
             indices = indices[
                 : int(indices.shape[0] * self.conf.perceptual_loss_proportion)
             ]
 
+            # Take only the least noisy samples
             x_0_hat = x_0_hat[indices]
             pixel_values = pixel_values[indices]
+
+            # TODO remove later
+            if self.global_step % 100 == 0:
+                viz = torch.cat((pixel_values[0], x_0_hat[0]), -1)
+                viz = (
+                    viz.detach()
+                    .add(1)
+                    .div(2)
+                    .clip(0, 1)
+                    .mul(255)
+                    .round()
+                    .to(torch.uint8)
+                    .cpu()
+                )
+                torchvision.io.write_png(
+                    viz, self.artifact_path / f"viz-{self.global_step:06}.png"
+                )
 
             lpips_loss = 0.0
             if self.conf.lpips_weight > 0.0 and self.lpips_loss_fn is not None:
@@ -323,7 +433,9 @@ class Trainer:
             loss_dict["loss"]
             + lpips_loss * self.conf.lpips_weight
             + convnext_loss * self.conf.convnext_weight
+            + repa_loss * self.conf.repa_weight
         )
+        loss_dict["repa_loss"] = repa_loss
         loss_dict["total_loss"] = total_loss
         loss_dict["lpips_loss"] = lpips_loss
         loss_dict["convnext_loss"] = convnext_loss
@@ -343,7 +455,7 @@ class Trainer:
             for k, v in loss_dict.items()
         }
 
-        # Gradient clipping (per param group to preserve original behavior)
+        # Gradient clipping
         for p_group in self.adamw_groups + self.muon_groups:
             torch.nn.utils.clip_grad_norm_(p_group["params"], max_norm=1.0)
 
@@ -370,7 +482,7 @@ class Trainer:
         self.optim_adamw.zero_grad(set_to_none=True)
         self.optim_muon.zero_grad(set_to_none=True)
 
-        # Update EMA (with warmup on the decay factor)
+        # Update EMA with warmup
         ema_beta = (
             warmup_p * self.conf.ema_beta
         )  # Starts low, increases to conf.ema_beta
@@ -482,7 +594,9 @@ class Trainer:
     def train(self) -> None:
         """Main training loop."""
         for epoch in range(self.conf.num_train_epochs):
-            for batch in tqdm(self.train_loader, desc=f"Epoch {epoch}"):
+            for batch in tqdm(
+                self.train_loader, desc=f"Epoch {epoch}", dynamic_ncols=True, leave=True
+            ):
                 log_dict = self._train_step(batch)
 
                 # Convert tensors to scalars for logging

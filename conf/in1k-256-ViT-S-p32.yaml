@@ -1,0 +1,47 @@
+conf:
+  model:
+    input_size: 3072
+    hidden_size: 384
+    head_dim: 64
+    num_attention_heads: 6
+    num_blocks: 12
+    should_pin_adaln: true
+  flow:
+    time_shift_dim: 196608
+    time_shift_base: 4096
+    eps: 0.001
+    prediction_mode: clean_input
+    norm_p: 1.0
+    norm_eps: 0.01
+  dataset_path_or_url: benjamin-paine/imagenet-1k-256x256
+  patch_size: 32
+  batch_size: 256
+  num_workers: 8
+  num_train_epochs: 1000
+  ema_beta: 0.9995
+  num_warmup_steps: 40000
+  lr_muon: 0.001
+  lr_adamw: 0.0001
+  betas_adamw:
+  - 0.9
+  - 0.997
+  weight_decay_adamw: 0.01
+  weight_decay_muon: 0.01
+  momentum_muon: 0.95
+
+  repa_output_size: 768
+
+  lpips_weight: 0.4
+  convnext_weight: 0.1
+  repa_weight: 1.0
+  perceptual_loss_proportion: 0.5
+
+  wandb_project_name: minimal-pixel-meanflow-in1k-256
+  wandb_log_every_num_steps: 50
+  validate_every_num_steps: 5000
+  save_every_num_steps: 500
+  max_num_checkpoints: 5
+  should_compile: true
+  device_str: cuda
+  dtype_str: bfloat16
+train: {}

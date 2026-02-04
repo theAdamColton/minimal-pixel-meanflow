@@ -3,7 +3,6 @@ from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
 import transformers
-from transformers.modeling_outputs import BaseModelOutputWithNoAttention
 import lpips
 
 
@@ -18,6 +17,7 @@ class DinoV3Encoder(nn.Module):
             .requires_grad_(False)
         )
         self.hidden_size = self.dino.config.hidden_size
+        self.patch_size = self.dino.config.patch_size
 
         # Imagenet pixelwise mean and std
         self.register_buffer(
@@ -260,8 +260,8 @@ class LPIPSLoss(nn.Module):
 class REPAProjector2D(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.net = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
+        self.conv = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
 
     def forward(self, x):
         # Expects [B, D, H, W]
-        return self.net(x)
+        return self.conv(x)

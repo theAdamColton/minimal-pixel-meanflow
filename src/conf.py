@@ -30,16 +30,20 @@ class MainConfig:
     weight_decay_muon: float = 1e-2
     momentum_muon: float = 0.95
 
+    perceptual_loss_proportion: float = 0.5
+
+    repa_output_size: int = 768
+    repa_depth: int = 6
+
     lpips_weight: float = 0.0
     convnext_weight: float = 0.0
+    repa_weight: float = 0.0
 
     wandb_project_name: str = "minimal-pixel-meanflow"
     wandb_log_every_num_steps: int = 50
     validate_every_num_steps: int = 500
     save_every_num_steps: int = 500
     max_num_checkpoints: int = 5
-
-    perceptual_loss_proportion: float = 0.5
 
     should_compile: bool = True
 

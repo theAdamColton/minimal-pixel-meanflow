@@ -65,7 +65,9 @@ class FlowHelper:
 
     def sample_euler(
         self,
-        net: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        net: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, dict]
+        ],
         x_1: torch.Tensor,
         num_steps: int = 4,
     ):
@@ -84,7 +86,7 @@ class FlowHelper:
             t_in = unsqueeze_trailing(t_curr, x_t)
             r_in = unsqueeze_trailing(t_next, x_t)
 
-            model_out = net(x_t, r_in, t_in)
+            model_out, _ = net(x_t, r_in, t_in)
             u = self.get_velocity(model_out, x_t, t_in)
 
             x_t = x_t + u * dt
@@ -94,8 +96,10 @@ class FlowHelper:
     def compute_meanflow_loss(
         self,
         x_0: torch.Tensor,
-        # Net signature: (x_t, r, t) -> Prediction (x_0 or v)
-        net: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        # Net signature: (x_t, r, t) -> (Prediction (x_0 or v), dict)
+        net: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, dict]
+        ],
         timesteps_shape: tuple,
         torch_rng: torch.Generator | None = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
@@ -117,7 +121,7 @@ class FlowHelper:
         v_g = x_1 - x_0
 
         # Predict Instantaneous Velocity (v) for JVP Tangent
-        pred_inst = net(z, t, t)
+        pred_inst, supplemental_outputs = net(z, t, t)
         v_inst = self.get_velocity(pred_inst, z, t)
 
         # JVP Calculation for Mean Flow
@@ -127,7 +131,7 @@ class FlowHelper:
         # Tangents: (dz/dt, dr/dt, dt/dt) -> (v_inst, 0, 1)
 
         def u_wrapper(z_in, r_in, t_in):
-            out = net(z_in, r_in, t_in)
+            out, _ = net(z_in, r_in, t_in)
             return self.get_velocity(out, z_in, t_in)
 
         # Ensure tangents are detached from graph (treated as constants for the differentiation)
@@ -139,6 +143,7 @@ class FlowHelper:
             u_wrapper, (z, r, t), (v_inst_detached, zeros_like_r, ones_like_t)
         )
 
+        # Equation (7) of Pixel Meanflow
         # Construct Compound Vector Field V
         V = u + (t - r) * dudt.detach()
 
@@ -150,12 +155,15 @@ class FlowHelper:
 
         # Instantaneous Loss (Auxiliary Flow Matching)
         # This is required to ensure v_inst (used in JVP) is accurate
+        #
+        # Note that this loss is not mentioned in the paper
         loss_v_raw = F.mse_loss(v_inst, v_g, reduction="none").mean(dim=(1, 2, 3))
         loss_v = self.adaptive_weighting(loss_v_raw).mean()
 
         total_loss = loss_u + loss_v
 
-        x_0_hat = z - u * (t - r)
+        # Equation (8) of Pixel Meanflow
+        x_0_hat = z - u * t
 
         return (
             {
@@ -163,5 +171,5 @@ class FlowHelper:
                 "loss_mf": loss_u,
                 "loss_fm": loss_v,
             },
-            {"x_0_hat": x_0_hat, "r": r, "t": t},
+            {"x_0_hat": x_0_hat, "r": r, "t": t, **supplemental_outputs},
         )
