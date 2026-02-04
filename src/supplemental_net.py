@@ -1,3 +1,4 @@
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -75,16 +76,20 @@ class BatchedRandomResizedCrop(torch.nn.Module):
         self.resize_mode = resize_mode
         self.torch_rng = torch_rng
 
-    def get_params(self, batch_size, height, width):
+    def get_params(self, batch_size, height, width, device=torch.device("cpu")):
         area = height * width
 
         # Randomly sample scales and ratios for the whole batch
-        log_ratio = torch.log(torch.tensor(self.ratio))
+        log_ratio = tuple(math.log(x) for x in self.ratio)
 
         # Generate random scales and ratios
-        scales = torch.empty(batch_size).uniform_(*self.scale, generator=self.torch_rng)
+        scales = torch.empty(batch_size, device=device).uniform_(
+            *self.scale, generator=self.torch_rng
+        )
         ratios = torch.exp(
-            torch.empty(batch_size).uniform_(*log_ratio, generator=self.torch_rng)
+            torch.empty(batch_size, device=device).uniform_(
+                *log_ratio, generator=self.torch_rng
+            )
         )
 
         target_areas = scales * area
@@ -96,12 +101,12 @@ class BatchedRandomResizedCrop(torch.nn.Module):
         h = torch.clamp(h, max=height)
 
         # Randomly sample top-left corners
-        i = torch.empty(batch_size).uniform_(0, 1, generator=self.torch_rng) * (
-            height - h
-        )
-        j = torch.empty(batch_size).uniform_(0, 1, generator=self.torch_rng) * (
-            width - w
-        )
+        i = torch.empty(batch_size, device=device).uniform_(
+            0, 1, generator=self.torch_rng
+        ) * (height - h)
+        j = torch.empty(batch_size, device=device).uniform_(
+            0, 1, generator=self.torch_rng
+        ) * (width - w)
 
         return i.long(), j.long(), h, w
 
@@ -223,7 +228,9 @@ class ConvNextV2Loss(nn.Module):
         # Expects [B, C, H, W] in (-1,1)
         b, _, h, w = pixel_values_real.shape
 
-        crop_params = self.random_resized_crop.get_params(b, h, w)
+        crop_params = self.random_resized_crop.get_params(
+            b, h, w, device=pixel_values_real.device
+        )
 
         pixel_values_synth = self.random_resized_crop(pixel_values_synth, crop_params)
         pixel_values_real = self.random_resized_crop(pixel_values_real, crop_params)
@@ -263,7 +270,9 @@ class LPIPSLoss(nn.Module):
         # Expects [B, C, H, W] in (-1,1)
         b, _, h, w = pixel_values_real.shape
 
-        crop_params = self.random_resized_crop.get_params(b, h, w)
+        crop_params = self.random_resized_crop.get_params(
+            b, h, w, device=pixel_values_real.device
+        )
 
         pixel_values_synth = self.random_resized_crop(pixel_values_synth, crop_params)
         pixel_values_real = self.random_resized_crop(pixel_values_real, crop_params)

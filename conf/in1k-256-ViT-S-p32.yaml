@@ -15,7 +15,7 @@ conf:
     norm_eps: 0.01
   dataset_path_or_url: benjamin-paine/imagenet-1k-256x256
   patch_size: 32
-  batch_size: 256
+  batch_size: 64
   num_workers: 8
   num_train_epochs: 1000
   ema_beta: 0.9995
@@ -38,7 +38,7 @@ conf:
 
   wandb_project_name: minimal-pixel-meanflow-in1k-256
   wandb_log_every_num_steps: 50
-  validate_every_num_steps: 5000
+  validate_every_num_steps: 1000
   save_every_num_steps: 500
   max_num_checkpoints: 5
   should_compile: true

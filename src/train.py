@@ -118,8 +118,9 @@ class Trainer:
         self._setup_models()
         self._setup_optimizers()
 
+        self._compute_losses_training = self._compute_losses
         if conf.should_compile:
-            self._compute_losses = torch.compile(
+            self._compute_losses_training = torch.compile(
                 self._compute_losses, fullgraph=True, dynamic=False
             )
 
@@ -474,7 +475,7 @@ class Trainer:
 
     def _train_step(self, batch: dict[str, Any]) -> dict[str, float]:
         """Execute a single training step."""
-        loss_dict, _ = self._compute_losses(batch)
+        loss_dict, _ = self._compute_losses_training(batch)
         del batch
 
         total_loss = loss_dict["total_loss"]
