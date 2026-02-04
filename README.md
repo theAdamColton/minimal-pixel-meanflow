@@ -18,3 +18,10 @@ Intermediate generation outputs are saved in out/..../artifacts.
 Here is what the generated samples look like after 54 epochs:
 
 <img width="1054" height="1054" alt="272500" src="https://github.com/user-attachments/assets/2fbd0655-7c6d-43a5-953c-ea32aab157ac" />
+
+# Implementation Details
+
+I compute perceptual losses on the less noisy samples differently from their implementation.
+They compute perceptual losses on predicted samples from timesteps less than some threshold t_thr.
+I instead compute perceptual losses on a fixed proportion of lowest timesteps.
+This allows me to torch.compile the entire loss function.

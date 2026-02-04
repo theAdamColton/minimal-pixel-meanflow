@@ -395,6 +395,14 @@ class ViTDenoiserOutput(NamedTuple):
 
 
 class ViTDenoiser(nn.Module):
+    """
+    ViTDenoiser that uses AdaLN, and 2-timestep conditioning
+
+    Uses DerfNorm, as introduced by:
+        Stronger Normalization-Free Transformers (2025)
+        https://arxiv.org/abs/2512.10938
+    """
+
     def __init__(self, conf: ViTDenoiserConfig = ViTDenoiserConfig()):
         super().__init__()
         self.conf = conf

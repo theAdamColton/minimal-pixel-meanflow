@@ -302,8 +302,6 @@ class Trainer:
             self.conf.dtype,
             enabled=self.conf.dtype != torch.float32,
         ):
-            # Calculate auxiliary losses on the less noisy samples
-
             # indices of the least noisy samples
             indices = timesteps.squeeze().argsort(descending=False)
             indices = indices[

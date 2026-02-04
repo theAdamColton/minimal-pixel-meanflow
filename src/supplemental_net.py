@@ -33,6 +33,7 @@ class DinoV3Encoder(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor):
         # Expects [..., h, w, c] in [-1, 1]
+        # Returns flattened patch features, [..., S, D]
         *leading, h, w, c = pixel_values.shape
         pixel_values = rearrange(pixel_values, "... h w c -> (...) c h w")
 
