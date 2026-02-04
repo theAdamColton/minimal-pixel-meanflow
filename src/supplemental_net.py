@@ -204,6 +204,22 @@ class ConvNextV2Loss(nn.Module):
     def forward(
         self, pixel_values_synth: torch.Tensor, pixel_values_real: torch.Tensor
     ):
+        """
+        This is my interpretation of the ConvNextv2 loss used by
+
+        https://arxiv.org/pdf/2512.10953
+        Bidirectional Normalizing Flow: From Data to Noise and Back (2025)
+
+        Quote from the paper, section B.3:
+            In addition to VGG features, we in-
+            corporate ConvNeXt V2 [61 ] (ImageNet-22K pre-trained,
+            base-size) as a complementary perceptual feature extractor.
+            Similar to the LPIPS, both the reconstructed image x′ and
+            the ground-truth image x are passed through the ConvNeXt
+            network after VAE decoding. The perceptual distance is
+            computed using the extracted features, excluding the final
+            classification head.
+        """
         # Expects [B, C, H, W] in (-1,1)
         b, _, h, w = pixel_values_real.shape
 

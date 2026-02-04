@@ -42,6 +42,7 @@ class MainConfig:
     wandb_project_name: str = "minimal-pixel-meanflow"
     wandb_log_every_num_steps: int = 50
     validate_every_num_steps: int = 500
+    num_validation_batches: int = 1
     save_every_num_steps: int = 500
     max_num_checkpoints: int = 5
 

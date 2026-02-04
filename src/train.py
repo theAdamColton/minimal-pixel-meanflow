@@ -46,6 +46,37 @@ def _find_closest_factors(b: int) -> Tuple[int, int]:
     raise ValueError(f"Could not find factors for {b}")
 
 
+def _make_grid(x: torch.Tensor):
+    """
+    x: shape (b,h,w,c) containing pixel values
+    """
+    b, *_ = x.shape
+
+    if x.dtype.is_floating_point:
+        # Convert [-1,1] pixel values to uint8
+        x = x.float().add(1).div(2).clamp(0, 1).mul(255).round().to(torch.uint8)
+    else:
+        assert x.dtype == torch.uint8
+
+    x = x.cpu()
+
+    # Add grid padding
+    pad = 2
+    h_padding = torch.zeros(b, pad, x.shape[2], x.shape[3], dtype=torch.uint8)
+    x = torch.cat((x, h_padding), dim=1)
+    w_padding = torch.zeros(b, x.shape[1], pad, x.shape[3], dtype=torch.uint8)
+    x = torch.cat((x, w_padding), dim=2)
+
+    # Arrange in grid
+    nh, nw = _find_closest_factors(b)
+    grid = rearrange(x, "(nh nw) h w c -> c (nh h) (nw w)", nh=nh, nw=nw)
+
+    # Remove padding from final grid
+    grid = grid[:, :-pad, :-pad]
+
+    return grid
+
+
 def clear_cuda_cache(func):
     """
     A decorator that performs garbage collection and clears the CUDA cache
@@ -112,9 +143,7 @@ class Trainer:
         self.checkpoint_path = self.run_path / "checkpoints"
         self.checkpoint_path.mkdir(exist_ok=True)
 
-        self.log_path = (
-            self.run_path / "logs.jsonl"
-        )  # Fixed: was "log.jsonl" in read code
+        self.log_path = self.run_path / "logs.jsonl"
         self.wandb_run = wandb.init(
             project=self.conf.wandb_project_name, config=asdict(self.conf)
         )
@@ -129,28 +158,35 @@ class Trainer:
         """Initialize datasets and dataloaders."""
         dataset = datasets.load_dataset(self.conf.dataset_path_or_url)
 
-        def apply_transforms(examples: dict[str, Any]) -> dict[str, Any]:
-            images = examples.pop("image")
-            examples["pixel_values"] = [pil_to_tensor(img) for img in images]
-            return examples
+        def transform_img(img):
+            return pil_to_tensor(img)
 
-        train_dataset = dataset["train"].with_transform(apply_transforms)
-        test_dataset = dataset["validation"].with_transform(apply_transforms)
+        def transform_row(row):
+            row["image"] = transform_img(row["image"])
+            return row
+
+        def transform_batch(samples):
+            samples["image"] = [transform_img(image) for image in samples["image"]]
+            return samples
+
+        train_dataset = (
+            dataset["train"]
+            .to_iterable_dataset(num_shards=1024)
+            .shuffle()
+            .map(transform_row)
+        )
+        test_dataset = dataset["validation"].with_transform(transform_batch)
 
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=self.conf.batch_size,
-            shuffle=True,
             num_workers=self.conf.num_workers,
             drop_last=True,
             persistent_workers=True,
         )
 
         self.test_loader = DataLoader(
-            test_dataset,
-            batch_size=self.conf.batch_size,
-            shuffle=False,
-            num_workers=self.conf.num_workers,
+            test_dataset, batch_size=self.conf.batch_size, shuffle=False
         )
 
     def _setup_models(self) -> None:
@@ -337,8 +373,10 @@ class Trainer:
 
         return teacher_hidden_states.float()
 
-    def _compute_losses(self, batch: dict[str, Any]):
-        pixel_values = batch.pop("pixel_values")
+    def _compute_losses(
+        self, batch: dict[str, Any], torch_rng: torch.Generator | None = None
+    ):
+        pixel_values = batch.pop("image")
 
         _, h, w, _ = pixel_values.shape
 
@@ -355,7 +393,9 @@ class Trainer:
         # Store input shape for validation
         self.input_shape = pixel_values.shape
 
-        loss_dict, extra_dict = self.flow_helper.compute_meanflow_loss(
+        extra_dict = dict()
+
+        loss_dict, meanflow_extra_dict = self.flow_helper.compute_meanflow_loss(
             x_0=pixel_values,
             net=partial(
                 self._forward_model,
@@ -363,10 +403,11 @@ class Trainer:
                 return_layer_indices=[self.conf.repa_depth],
             ),
             timesteps_shape=(pixel_values.shape[0], 1, 1, 1),
+            torch_rng=torch_rng,
         )
 
-        x_0_hat = extra_dict["x_0_hat"]
-        timesteps = extra_dict["t"]
+        x_0_hat = meanflow_extra_dict["x_0_hat"]
+        timesteps = meanflow_extra_dict["t"]
 
         with torch.autocast(
             self.conf.device.type,
@@ -377,7 +418,7 @@ class Trainer:
             if self.conf.repa_weight > 0.0 and self.dinov3_encoder is not None:
                 # Hidden states extracted from the nth layer when computing the
                 # instantaneous velocity
-                hidden_states = extra_dict["layer_hidden_states"].squeeze(0)
+                hidden_states = meanflow_extra_dict["layer_hidden_states"].squeeze(0)
                 hidden_states = rearrange(
                     hidden_states, "b (nph npw) d -> b d nph npw", nph=nph, npw=npw
                 )
@@ -386,6 +427,9 @@ class Trainer:
                 teacher_hidden_states = self._extract_repa_teacher_hidden_states(
                     pixel_values
                 )
+
+                extra_dict["teacher_hidden_states"] = teacher_hidden_states
+                extra_dict["projected_hidden_states"] = projected_hidden_states
 
                 repa_loss = -F.cosine_similarity(
                     projected_hidden_states, teacher_hidden_states, dim=1
@@ -403,23 +447,6 @@ class Trainer:
             # Take only the least noisy samples
             x_0_hat = x_0_hat[indices]
             pixel_values = pixel_values[indices]
-
-            # TODO remove later
-            if self.global_step % 100 == 0:
-                viz = torch.cat((pixel_values[0], x_0_hat[0]), -1)
-                viz = (
-                    viz.detach()
-                    .add(1)
-                    .div(2)
-                    .clip(0, 1)
-                    .mul(255)
-                    .round()
-                    .to(torch.uint8)
-                    .cpu()
-                )
-                torchvision.io.write_png(
-                    viz, self.artifact_path / f"viz-{self.global_step:06}.png"
-                )
 
             lpips_loss = 0.0
             if self.conf.lpips_weight > 0.0 and self.lpips_loss_fn is not None:
@@ -440,11 +467,14 @@ class Trainer:
         loss_dict["lpips_loss"] = lpips_loss
         loss_dict["convnext_loss"] = convnext_loss
 
-        return loss_dict
+        extra_dict["x_0_hat"] = x_0_hat
+        extra_dict["x_0"] = pixel_values
+
+        return loss_dict, extra_dict
 
     def _train_step(self, batch: dict[str, Any]) -> dict[str, float]:
         """Execute a single training step."""
-        loss_dict = self._compute_losses(batch)
+        loss_dict, _ = self._compute_losses(batch)
         del batch
 
         total_loss = loss_dict["total_loss"]
@@ -498,11 +528,8 @@ class Trainer:
 
     @clear_cuda_cache
     @torch.inference_mode()
-    def _validate_and_log(self) -> None:
-        """Generate validation samples and save images."""
-        if self.input_shape is None:
-            return
-
+    def _fast_validate(self):
+        # Generate some samples
         torch_rng = torch.Generator(self.conf.device)
         x_1 = torch.randn(
             *self.input_shape,
@@ -519,32 +546,59 @@ class Trainer:
                 num_steps=1,
             )
 
-        # Convert to uint8 HWC
-        x_0 = (
-            x_0.float().add(1).div(2).clamp(0, 1).mul(255).round().to(torch.uint8).cpu()
-        )
-
-        # Add grid padding
-        pad = 2
-        h_padding = torch.zeros(
-            x_0.shape[0], pad, x_0.shape[2], x_0.shape[3], dtype=torch.uint8
-        )
-        x_0 = torch.cat((x_0, h_padding), dim=1)
-        w_padding = torch.zeros(
-            x_0.shape[0], x_0.shape[1], pad, x_0.shape[3], dtype=torch.uint8
-        )
-        x_0 = torch.cat((x_0, w_padding), dim=2)
-
-        # Arrange in grid
-        b = self.input_shape[0]
-        nh, nw = _find_closest_factors(b)
-        grid = rearrange(x_0, "(nh nw) h w c -> c (nh h) (nw w)", nh=nh, nw=nw)
-
-        # Remove padding from final grid
-        grid = grid[:, :-pad, :-pad]
-
-        save_path = self.artifact_path / f"{self.global_step:06d}.png"
+        grid = _make_grid(x_0)
+        save_path = self.artifact_path / f"{self.global_step:07d}.png"
         torchvision.io.write_png(grid, str(save_path))
+
+        # Compute losses on validation batches
+        all_val_losses = []
+        for batch in self.test_loader:
+            loss_dict, extra_dict = self._compute_losses(batch, torch_rng=torch_rng)
+            loss_dict = {
+                k: v.detach().cpu().float() if isinstance(v, torch.Tensor) else v
+                for k, v in loss_dict.items()
+            }
+            all_val_losses.append(loss_dict)
+            if len(all_val_losses) >= self.conf.num_validation_batches:
+                break
+
+        # Save reconstruction grid
+        x_0_hat = extra_dict["x_0_hat"]
+        x_0 = extra_dict["x_0"]
+        vis = torch.cat((x_0, x_0_hat), -1)
+        grid = _make_grid(vis.movedim(1, -1))
+        save_path = self.artifact_path / f"noisy_rec_{self.global_step:07d}.png"
+        torchvision.io.write_png(grid, str(save_path))
+
+        # Save feature visualization
+        features = extra_dict["projected_hidden_states"]
+        _, _, nph, npw = features.shape
+        features = rearrange(features, "b d nph npw -> b (nph npw) d")
+        features_rgb, _, _ = torch.pca_lowrank(features.float(), q=3, niter=10)
+        min = features_rgb.amin(dim=1, keepdim=True)
+        max = features_rgb.amax(dim=1, keepdim=True)
+        features_rgb = (features_rgb - min) / (max - min).clip(1e-5)
+        features_rgb = features_rgb.clip(0, 1).mul(255).round().to(torch.uint8).cpu()
+        features_rgb = repeat(
+            features_rgb,
+            "b (nph npw) c -> b (nph ph) (npw pw) c",
+            nph=nph,
+            npw=npw,
+            ph=self.conf.patch_size,
+            pw=self.conf.patch_size,
+        )
+        grid = _make_grid(features_rgb)
+        save_path = self.artifact_path / f"features_{self.global_step:07d}.png"
+        torchvision.io.write_png(grid, str(save_path))
+
+        # Aggregate val losses
+        log_dict = dict()
+        for k in all_val_losses[0].keys():
+            v = [row[k] for row in all_val_losses]
+            v = torch.stack(v)
+            log_dict[f"val_{k}"] = v.mean().item()
+
+        return log_dict
 
     def _save_checkpoint(self) -> None:
         """Save model checkpoint and rotate old checkpoints."""
@@ -607,7 +661,8 @@ class Trainer:
                     self.global_step % self.conf.validate_every_num_steps == 0
                 )
                 if should_validate:
-                    self._validate_and_log()
+                    val_log_dict = self._fast_validate()
+                    log_dict.update(val_log_dict)
                     self._maybe_plot_losses()
 
                 should_save = self.global_step % self.conf.save_every_num_steps == 0
