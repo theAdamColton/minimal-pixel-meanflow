@@ -111,6 +111,7 @@ class Trainer:
     def __init__(self, conf: MainConfig):
         self.conf = conf
         self.global_step = 0
+        self.num_trained_samples = 0
         self.input_shape: Optional[Tuple[int, ...]] = None
 
         self.wandb_run_id = None
@@ -135,6 +136,7 @@ class Trainer:
             self.optim_adamw.load_state_dict(d["adamw"])
             self.optim_muon.load_state_dict(d["muon"])
             self.global_step = d["global_step"]
+            self.num_trained_samples = d["num_trained_samples"]
             self.wandb_run_id = d["wandb_run_id"]
 
         wandb_run = wandb.init(
@@ -185,12 +187,16 @@ class Trainer:
             samples["image"] = [transform_img(image) for image in samples["image"]]
             return samples
 
+        self.train_dataset_length = len(dataset["train"])
+
         train_dataset = (
             dataset["train"]
             .to_iterable_dataset(num_shards=1024)
+            .repeat(None)
             .shuffle()
             .map(transform_row)
         )
+
         test_dataset = dataset["validation"].with_transform(transform_batch)
 
         self.train_loader = DataLoader(
@@ -355,12 +361,15 @@ class Trainer:
 
         return x_0_hat.float(), {"layer_hidden_states": output.layer_hidden_states}
 
-    @torch.no_grad()
-    def _extract_repa_teacher_hidden_states(self, pixel_values: torch.Tensor):
-        pixel_values = pixel_values.to(self.conf.dtype)
+    def _compute_repa_loss(
+        self, pixel_values: torch.Tensor, student_hidden_states: torch.Tensor
+    ):
         _, h, w, _ = pixel_values.shape
 
-        _, teacher_hidden_states = self.dinov3_encoder(pixel_values)
+        # Compute teacher features fully in half dtype, no autocast
+        pixel_values = pixel_values.to(self.conf.dtype)
+        with torch.no_grad():
+            _, teacher_hidden_states = self.dinov3_encoder(pixel_values)
 
         teacher_hidden_states = rearrange(
             teacher_hidden_states,
@@ -369,32 +378,37 @@ class Trainer:
             npw=w // self.dinov3_encoder.patch_size,
         )
 
-        # Handle differing patch sizes between model and dinov3
-        dino_patch_factor = self.conf.patch_size / self.dinov3_encoder.patch_size
-        # Mean pool if dino patch size is smaller
-        if dino_patch_factor > 1:
-            teacher_hidden_states = F.avg_pool2d(
-                teacher_hidden_states,
-                kernel_size=int(dino_patch_factor),
-                stride=int(dino_patch_factor),
-            )
-
-        # Repeat (Nearest exact upsample) if dino patch size is bigger
-        if dino_patch_factor < 0:
-            repeat_factor = int(1 / dino_patch_factor)
-            teacher_hidden_states = repeat(
-                teacher_hidden_states,
-                "b d nph npw -> b d (nph r_h) (npw r_w)",
-                r_h=repeat_factor,
-                r_w=repeat_factor,
-            )
-
         # Spatial normalization
         mean = teacher_hidden_states.mean(dim=(2, 3), keepdim=True)
         std = teacher_hidden_states.std(dim=(2, 3), keepdim=True)
         teacher_hidden_states = (teacher_hidden_states - mean) / std
 
-        return teacher_hidden_states.float()
+        student_nph = h // self.conf.patch_size
+        student_npw = w // self.conf.patch_size
+        student_hidden_states = rearrange(
+            student_hidden_states,
+            "b (nph npw) d -> b d nph npw",
+            nph=student_nph,
+            npw=student_npw,
+        )
+
+        # Handle differing patch sizes between model and dinov3
+        scale_factor = self.conf.patch_size / self.dinov3_encoder.patch_size
+        student_hidden_states = F.interpolate(
+            student_hidden_states,
+            scale_factor=scale_factor,
+            mode="bilinear",
+        )
+
+        student_hidden_states = self.repa_projector(student_hidden_states)
+        repa_loss = -F.cosine_similarity(
+            student_hidden_states, teacher_hidden_states, dim=1
+        ).mean()
+
+        return repa_loss, {
+            "projected_hidden_states": student_hidden_states,
+            "teacher_hidden_states": teacher_hidden_states,
+        }
 
     def _compute_losses(
         self, batch: dict[str, Any], torch_rng: torch.Generator | None = None
@@ -402,9 +416,6 @@ class Trainer:
         pixel_values = batch.pop("image")
 
         _, h, w, _ = pixel_values.shape
-
-        nph = h // self.conf.patch_size
-        npw = w // self.conf.patch_size
 
         pixel_values = (
             pixel_values.to(self.conf.device, torch.float32)
@@ -441,22 +452,13 @@ class Trainer:
             if self.conf.repa_weight > 0.0 and self.dinov3_encoder is not None:
                 # Hidden states extracted from the nth layer when computing the
                 # instantaneous velocity
-                hidden_states = meanflow_extra_dict["layer_hidden_states"].squeeze(0)
-                hidden_states = rearrange(
-                    hidden_states, "b (nph npw) d -> b d nph npw", nph=nph, npw=npw
+                student_hidden_states = meanflow_extra_dict[
+                    "layer_hidden_states"
+                ].squeeze(0)
+                repa_loss, extra_dict_repa = self._compute_repa_loss(
+                    pixel_values, student_hidden_states
                 )
-                projected_hidden_states = self.repa_projector(hidden_states)
-
-                teacher_hidden_states = self._extract_repa_teacher_hidden_states(
-                    pixel_values
-                )
-
-                extra_dict["teacher_hidden_states"] = teacher_hidden_states
-                extra_dict["projected_hidden_states"] = projected_hidden_states
-
-                repa_loss = -F.cosine_similarity(
-                    projected_hidden_states, teacher_hidden_states, dim=1
-                ).mean()
+                extra_dict.update(extra_dict_repa)
 
             x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
             pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
@@ -498,7 +500,6 @@ class Trainer:
     def _train_step(self, batch: dict[str, Any]) -> dict[str, float]:
         """Execute a single training step."""
         loss_dict, _ = self._compute_losses_training(batch)
-        del batch
 
         total_loss = loss_dict["total_loss"]
         total_loss.backward()
@@ -594,32 +595,36 @@ class Trainer:
         torchvision.io.write_png(grid, str(save_path))
 
         # Save feature visualization
-        features = extra_dict["projected_hidden_states"]
-        _, _, nph, npw = features.shape
-        features = rearrange(features, "b d nph npw -> b (nph npw) d")
-        features_rgb, _, _ = torch.pca_lowrank(features.float(), q=3, niter=10)
-        min = features_rgb.amin(dim=1, keepdim=True)
-        max = features_rgb.amax(dim=1, keepdim=True)
-        features_rgb = (features_rgb - min) / (max - min).clip(1e-5)
-        features_rgb = features_rgb.clip(0, 1).mul(255).round().to(torch.uint8).cpu()
-        features_rgb = repeat(
-            features_rgb,
-            "b (nph npw) c -> b (nph ph) (npw pw) c",
-            nph=nph,
-            npw=npw,
-            ph=self.conf.patch_size,
-            pw=self.conf.patch_size,
-        )
-        grid = _make_grid(features_rgb)
-        save_path = self.artifact_path / f"features_{self.global_step:07d}.png"
-        torchvision.io.write_png(grid, str(save_path))
+        features = extra_dict.get("projected_hidden_states")
+        if features is not None:
+            _, _, nph, npw = features.shape
+            features = rearrange(features, "b d nph npw -> b (nph npw) d")
+            features_rgb, _, _ = torch.pca_lowrank(features.float(), q=3, niter=10)
+            min = features_rgb.amin(dim=1, keepdim=True)
+            max = features_rgb.amax(dim=1, keepdim=True)
+            features_rgb = (features_rgb - min) / (max - min).clip(1e-5)
+            features_rgb = (
+                features_rgb.clip(0, 1).mul(255).round().to(torch.uint8).cpu()
+            )
+            features_rgb = repeat(
+                features_rgb,
+                "b (nph npw) c -> b (nph ph) (npw pw) c",
+                nph=nph,
+                npw=npw,
+                ph=self.dinov3_encoder.patch_size,
+                pw=self.dinov3_encoder.patch_size,
+            )
+            grid = _make_grid(features_rgb)
+            save_path = self.artifact_path / f"features_{self.global_step:07d}.png"
+            torchvision.io.write_png(grid, str(save_path))
 
         # Aggregate val losses
         log_dict = dict()
         for k in all_val_losses[0].keys():
             v = [row[k] for row in all_val_losses]
-            v = torch.stack(v)
-            log_dict[f"val_{k}"] = v.mean().item()
+            v = [x.item() if isinstance(x, torch.Tensor) else x for x in v]
+            v_mean = sum(v) / len(v)
+            log_dict[f"val_{k}"] = v_mean
 
         return log_dict
 
@@ -631,6 +636,7 @@ class Trainer:
             "adamw": self.optim_adamw.state_dict(),
             "muon": self.optim_muon.state_dict(),
             "global_step": self.global_step,
+            "num_trained_samples": self.num_trained_samples,
             "wandb_run_id": self.wandb_run_id,
         }
 
@@ -669,38 +675,45 @@ class Trainer:
         plt.close()
 
     def train(self) -> None:
-        for epoch in range(self.conf.num_train_epochs):
-            for batch in tqdm(
-                self.train_loader, desc=f"Epoch {epoch}", dynamic_ncols=True, leave=True
-            ):
-                log_dict = self._train_step(batch)
+        prog_bar = tqdm(dynamic_ncols=True, leave=True)
+        data_iter = iter(self.train_loader)
+        while True:
+            batch = next(data_iter)
+            num_batch_samples = len(batch["image"])
+            log_dict = self._train_step(batch)
 
-                # Convert tensors to scalars for logging
-                log_dict["epoch"] = epoch
-                log_dict["global_step"] = self.global_step
+            log_dict["epoch"] = self.num_trained_samples / self.train_dataset_length
+            log_dict["global_step"] = self.global_step
 
-                should_validate = (
-                    self.global_step % self.conf.validate_every_num_steps == 0
-                )
-                if should_validate:
-                    val_log_dict = self._fast_validate()
-                    log_dict.update(val_log_dict)
+            should_validate = self.global_step % self.conf.validate_every_num_steps == 0
+            if should_validate:
+                val_log_dict = self._fast_validate()
+                log_dict.update(val_log_dict)
 
-                should_save = self.global_step % self.conf.save_every_num_steps == 0
-                if should_save:
-                    self._save_checkpoint()
+            should_log_wandb = (
+                self.global_step % self.conf.wandb_log_every_num_steps == 0
+            ) or should_validate
+            if should_log_wandb:
+                self._log_wandb(log_dict)
 
-                should_log_wandb = (
-                    self.global_step % self.conf.wandb_log_every_num_steps == 0
-                ) or should_validate
-                if should_log_wandb:
-                    self._log_wandb(log_dict)
+            self._log(log_dict)
 
-                self._log(log_dict)
+            if should_validate:
+                self._maybe_plot_losses()
 
-                if should_validate:
-                    self._maybe_plot_losses()
+            prog_bar.update(1)
+            prog_bar.set_description(
+                f"epoch:{log_dict['epoch']:.2f} step:{log_dict['global_step']:07d} loss:{log_dict['total_loss']:.3f}"
+            )
+            self.global_step += 1
+            self.num_trained_samples += num_batch_samples
 
-                self.global_step += 1
+            should_save = self.global_step % self.conf.save_every_num_steps == 0
+            if should_save:
+                self._save_checkpoint()
 
+            if log_dict["epoch"] >= self.conf.num_train_epochs:
+                break
+
+        prog_bar.close()
         self._save_checkpoint()
