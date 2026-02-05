@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 
@@ -41,12 +42,16 @@ class MainConfig:
 
     wandb_project_name: str = "minimal-pixel-meanflow"
     wandb_log_every_num_steps: int = 50
+    wandb_force_new_run: bool = True
+
     validate_every_num_steps: int = 500
     num_validation_batches: int = 1
     save_every_num_steps: int = 500
     max_num_checkpoints: int = 5
 
     should_compile: bool = True
+
+    resume_checkpoint_path: str | None = None
 
     device_str: str = "cuda"
     dtype_str: str = "bfloat16"

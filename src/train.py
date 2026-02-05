@@ -50,7 +50,7 @@ def _make_grid(x: torch.Tensor):
     """
     x: shape (b,h,w,c) containing pixel values
     """
-    b, *_ = x.shape
+    b, h, w, c = x.shape
 
     if x.dtype.is_floating_point:
         # Convert [-1,1] pixel values to uint8
@@ -62,9 +62,9 @@ def _make_grid(x: torch.Tensor):
 
     # Add grid padding
     pad = 2
-    h_padding = torch.zeros(b, pad, x.shape[2], x.shape[3], dtype=torch.uint8)
+    h_padding = torch.zeros(b, pad, w, c, dtype=torch.uint8)
     x = torch.cat((x, h_padding), dim=1)
-    w_padding = torch.zeros(b, x.shape[1], pad, x.shape[3], dtype=torch.uint8)
+    w_padding = torch.zeros(b, h + pad, pad, c, dtype=torch.uint8)
     x = torch.cat((x, w_padding), dim=2)
 
     # Arrange in grid
@@ -113,6 +113,7 @@ class Trainer:
         self.global_step = 0
         self.input_shape: Optional[Tuple[int, ...]] = None
 
+        self.wandb_run_id = None
         self._setup_paths()
         self._setup_data()
         self._setup_models()
@@ -125,6 +126,23 @@ class Trainer:
             )
 
         self._save_config()
+
+        if conf.resume_checkpoint_path is not None:
+            d = torch.load(conf.resume_checkpoint_path)
+            print("Loading checkpoint")
+            self.model.load_state_dict(d["model"])
+            self.ema_model.load_state_dict(d["ema_model"])
+            self.optim_adamw.load_state_dict(d["adamw"])
+            self.optim_muon.load_state_dict(d["muon"])
+            self.global_step = d["global_step"]
+            self.wandb_run_id = d["wandb_run_id"]
+
+        wandb_run = wandb.init(
+            project=self.conf.wandb_project_name,
+            config=asdict(self.conf),
+            id=self.wandb_run_id if not conf.wandb_force_new_run else None,
+        )
+        self.wandb_run_id = wandb_run.id
 
     def _setup_paths(self) -> None:
         """Initialize output directory structure."""
@@ -145,9 +163,6 @@ class Trainer:
         self.checkpoint_path.mkdir(exist_ok=True)
 
         self.log_path = self.run_path / "logs.jsonl"
-        self.wandb_run = wandb.init(
-            project=self.conf.wandb_project_name, config=asdict(self.conf)
-        )
 
     def _save_config(self) -> None:
         """Save run configuration to JSON."""
@@ -218,6 +233,13 @@ class Trainer:
             )
 
         self.flow_helper = FlowHelper(self.conf.flow)
+
+    def _log(self, log_dict):
+        with open(self.log_path, "a") as f:
+            f.write(json.dumps(log_dict) + "\n")
+
+    def _log_wandb(self, log_dict):
+        wandb.log(log_dict, step=self.global_step)
 
     def _classify_params(self) -> Tuple[list, list]:
         """Separate parameters for AdamW and Muon optimizers."""
@@ -609,7 +631,7 @@ class Trainer:
             "adamw": self.optim_adamw.state_dict(),
             "muon": self.optim_muon.state_dict(),
             "global_step": self.global_step,
-            "wandb_run_id": self.wandb_run.id,
+            "wandb_run_id": self.wandb_run_id,
         }
 
         save_path = self.checkpoint_path / f"{self.global_step:06d}.pt"
@@ -647,7 +669,6 @@ class Trainer:
         plt.close()
 
     def train(self) -> None:
-        """Main training loop."""
         for epoch in range(self.conf.num_train_epochs):
             for batch in tqdm(
                 self.train_loader, desc=f"Epoch {epoch}", dynamic_ncols=True, leave=True
@@ -664,25 +685,22 @@ class Trainer:
                 if should_validate:
                     val_log_dict = self._fast_validate()
                     log_dict.update(val_log_dict)
-                    self._maybe_plot_losses()
 
                 should_save = self.global_step % self.conf.save_every_num_steps == 0
                 if should_save:
                     self._save_checkpoint()
 
-                # JSONL logging (append mode)
-                with open(self.log_path, "a") as f:
-                    f.write(json.dumps(log_dict) + "\n")
-
                 should_log_wandb = (
                     self.global_step % self.conf.wandb_log_every_num_steps == 0
                 ) or should_validate
-                if should_log_wandb and self.wandb_run:
-                    wandb.log(log_dict, step=self.global_step)
+                if should_log_wandb:
+                    self._log_wandb(log_dict)
+
+                self._log(log_dict)
+
+                if should_validate:
+                    self._maybe_plot_losses()
 
                 self.global_step += 1
-
-        if self.wandb_run:
-            self.wandb_run.finish()
 
         self._save_checkpoint()
