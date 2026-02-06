@@ -21,7 +21,20 @@ Here is what the generated samples look like after 54 epochs:
 
 # Implementation Details
 
-I compute perceptual losses on the less noisy samples differently from their implementation.
+### Transformer
+
+I use DerfNorm, Box-RoPE-2d which is similar to dinov3, and QK normalization. Note that ALL Normalization layers
+were replaced with DerfNorm.
+
+### Perceptual losses
+
 They compute perceptual losses on predicted samples from timesteps less than some threshold t_thr.
 I instead compute perceptual losses on a fixed proportion of lowest timesteps.
 This allows me to torch.compile the entire loss function.
+
+My Convnextv2 loss seems slightly broken right now. The LPIPs seems to work fine.
+
+Before computing Convnextv2 or LPIPs I random resized crop each individual image.
+
+I add an additional REPA loss in the style of iREPA (https://arxiv.org/pdf/2512.10794). Hidden states
+come from an intermediate layer from the forward pass used to compute the instantaneous velocity prediction.
