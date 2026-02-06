@@ -133,6 +133,7 @@ class Trainer:
             print("Loading checkpoint")
             self.model.load_state_dict(d["model"])
             self.ema_model.load_state_dict(d["ema_model"])
+            self.repa_projector.load_state_dict(d["repa_projector"])
             self.optim_adamw.load_state_dict(d["adamw"])
             self.optim_muon.load_state_dict(d["muon"])
             self.global_step = d["global_step"]
@@ -633,6 +634,7 @@ class Trainer:
         checkpoint = {
             "model": self.model.state_dict(),
             "ema_model": self.ema_model.state_dict(),
+            "repa_projector": self.repa_projector.state_dict(),
             "adamw": self.optim_adamw.state_dict(),
             "muon": self.optim_muon.state_dict(),
             "global_step": self.global_step,
