@@ -118,6 +118,10 @@ class FlowHelper:
         torch_rng: torch.Generator | None = None,
         unc_label_id: int = 1023,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """
+        4 forward passes w/o gradients,
+        1 forward pass w/ grads
+        """
         device, dtype = x_0.device, x_0.dtype
         conf = self.conf
 
@@ -158,57 +162,69 @@ class FlowHelper:
         # Target instantaneous velocity
         v = x_1 - x_0
 
-        # Predicted instantaneous velocity using cfg,
-        # and save supplemental_outputs when forwarding with labels
-        pred_inst_cond, supplemental_outputs = net(x_t, t, t, cfg_scale, labels)
-        v_hat_cond = self.get_velocity(pred_inst_cond, x_t, t)
-        pred_inst_unc, _ = net(x_t, t, t, cfg_scale, unconditional_labels)
-        v_hat_unc = self.get_velocity(pred_inst_unc, x_t, t)
-        v_hat_guided = v + (1 - 1 / cfg_scale) * (v_hat_cond - v_hat_unc)
+        with torch.no_grad():
+            # Predicted instantaneous velocity using cfg
+            # TODO make this batched
+            pred_inst_cond, _ = net(x_t, t, t, cfg_scale, labels)
+            v_hat_cond = self.get_velocity(pred_inst_cond, x_t, t)
+            pred_inst_unc, _ = net(x_t, t, t, cfg_scale, unconditional_labels)
+            v_hat_unc = self.get_velocity(pred_inst_unc, x_t, t)
+            v_hat_guided = v + (1 - 1 / cfg_scale) * (v_hat_cond - v_hat_unc)
 
-        # Drop labels randomly
-        uncondition_mask = (
-            torch.rand(
-                (labels.shape[0],), generator=torch_rng, device=device, dtype=dtype
+            # Drop labels randomly
+            uncondition_mask = (
+                torch.rand(
+                    (labels.shape[0],), generator=torch_rng, device=device, dtype=dtype
+                )
+                < conf.uncondition_rate
             )
-            < conf.uncondition_rate
-        )
-        labels = labels.masked_fill(uncondition_mask, unc_label_id)
-        # Predict unguided velocity/trajectory when labels are absent
-        v_target = masked_fill(unsqueeze_trailing(uncondition_mask, v), v, v_hat_guided)
+            labels = labels.masked_fill(uncondition_mask, unc_label_id)
+            # Predict unguided velocity/trajectory when labels are absent
+            v_target = masked_fill(
+                unsqueeze_trailing(uncondition_mask, v), v, v_hat_guided
+            )
 
-        # JVP Calculation for Mean Flow
-        # We need d(u_fn)/dt.
-        # u_fn = (z - net(z, r, t))/t
-        # Primals: (z, r, t)
-        # Tangents: (dz/dt, dr/dt, dt/dt) -> (v_inst, 0, 1)
+            # JVP Calculation for Mean Flow
+            # We need d(u_fn)/dt.
+            # u_fn = (z - net(z, r, t))/t
+            # Primals: (z, r, t)
+            # Tangents: (dz/dt, dr/dt, dt/dt) -> (v_inst, 0, 1)
 
-        def u_wrapper(x_in, r_in, t_in):
-            out, _ = net(x_in, r_in, t_in, cfg_scale, labels)
-            return self.get_velocity(out, x_in, t_in)
+            def u_wrapper(x_in, r_in, t_in):
+                out, _ = net(x_in, r_in, t_in, cfg_scale, labels)
+                return self.get_velocity(out, x_in, t_in)
 
-        # TODO there is a discrepancy between pixel-mean-flow's
-        # alogorithm 2, and improved-mean-flow's code. I follow the code's
-        # implementation and use the conditioned velocity as the jvp tangents
+            # TODO, The paper and the official iMF compute the trajectory u,
+            # and dudt in a single call to jvp. However, jvp doesn't
+            # play nice with torch's autocast and backwards differentiation,
+            # so as a temporary fix I compute dudt and u seperately
 
-        zeros_like_r = torch.zeros_like(r)
-        ones_like_t = torch.ones_like(t)
-        u, dudt = torch.func.jvp(
-            u_wrapper, (x_t, r, t), (v_hat_cond, zeros_like_r, ones_like_t)
-        )
+            # TODO there is a discrepancy between pixel-mean-flow's
+            # alogorithm 2, and improved-mean-flow's code. I follow the code's
+            # implementation and use the conditioned velocity as the jvp tangents
+
+            zeros_like_r = torch.zeros_like(r)
+            ones_like_t = torch.ones_like(t)
+            _, dudt = torch.func.jvp(
+                u_wrapper, (x_t, r, t), (v_hat_cond, zeros_like_r, ones_like_t)
+            )
+
+        prediction, supplemental_outputs = net(x_t, r, t, cfg_scale, labels)
+        u = self.get_velocity(prediction, x_t, t)
 
         # Equation (7) of Pixel Meanflow
         # Construct Compound Vector Field V
-        V = u + (t - r) * dudt.detach()
+        V = u + (t - r) * dudt
 
         # Compute Losses
 
         # Trajectory Loss (improved mean flow)
-        loss_u_raw = F.mse_loss(V, v_target.detach(), reduction="none").mean(
-            dim=(1, 2, 3)
-        )
+        loss_u_raw = F.mse_loss(V, v_target, reduction="none").mean(dim=(1, 2, 3))
         loss_u = self.adaptive_weighting(loss_u_raw).mean()
 
+        # TODO , we don't need instantaneous velocity loss,
+        # because we don't use a supplemental v head.
+        #
         # # Instantaneous Loss (Auxiliary Flow Matching)
         # # This is required to ensure v_inst (used in JVP) is accurate
         # #

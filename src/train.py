@@ -230,10 +230,6 @@ class Trainer:
         self.ema_model.load_state_dict(self.model.state_dict())
         self.ema_model.requires_grad_(False)
 
-        # TODO
-        self.repa_projector = self.repa_projector.to(self.conf.dtype)
-        self.model = self.model.to(self.conf.dtype)
-
         self.dinov3_encoder = None
         if self.conf.repa_weight > 0:
             self.dinov3_encoder = DinoV3Encoder().to(self.conf.device, self.conf.dtype)
@@ -376,7 +372,6 @@ class Trainer:
             pw=self.conf.patch_size,
         )
 
-        # TODO
         x_0_hat = x_0_hat.to(dtype)
 
         return x_0_hat, {"layer_hidden_states": output.layer_hidden_states}
@@ -437,7 +432,9 @@ class Trainer:
         pixel_values = batch.pop(self.conf.dataset_image_column_name)
         labels = batch.pop(self.conf.dataset_label_column_name)
 
-        pixel_values = pixel_values.to(device, dtype).div_(255.0).mul_(2.0).sub_(1.0)
+        pixel_values = (
+            pixel_values.to(device, torch.float32).div_(255.0).mul_(2.0).sub_(1.0)
+        )
         labels = labels.to(device)
 
         # Store input shape for validation
@@ -512,7 +509,8 @@ class Trainer:
 
     def _train_step(self, batch: dict[str, Any]) -> dict[str, float]:
         """Execute a single training step."""
-        loss_dict, _ = self._compute_losses_training(batch)
+        with self._autocast():
+            loss_dict, _ = self._compute_losses_training(batch)
 
         total_loss = loss_dict["total_loss"]
         total_loss.backward()
@@ -570,7 +568,7 @@ class Trainer:
     def _fast_validate(self):
         model = self.ema_model
         device = self.conf.device
-        dtype = next(iter(p for p in model.parameters() if p.is_floating_point())).dtype
+        dtype = torch.float32
 
         assert self.input_shape is not None
 
@@ -605,7 +603,8 @@ class Trainer:
         # Compute losses on validation batches
         all_val_losses = []
         for batch in self.test_loader:
-            loss_dict, extra_dict = self._compute_losses(batch, torch_rng=torch_rng)
+            with self._autocast():
+                loss_dict, extra_dict = self._compute_losses(batch, torch_rng=torch_rng)
             loss_dict = {
                 k: v.detach().cpu().float() if isinstance(v, torch.Tensor) else v
                 for k, v in loss_dict.items()

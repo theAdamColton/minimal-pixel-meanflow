@@ -43,7 +43,7 @@ come from an intermediate layer from the forward pass used to compute the instan
 
 The diffusion model accepts a CFG scale as an input. During training it estimates the guided velocity and mean trajectory. Unlike iMF and pMF I do not use CFG interval as a model input and instead only apply CFG to samples that are noised within some CFG interval (by default 0.1 to 0.7]).
 
-### Floating Point Precision
+### Floating Point Precision and JVP
 
 I couldn't seem to figure out how to use torch's autocast when using JVP.
-Instead I use full bfloat16 for gradients and model weights. The EMA model is kept in float32.
+So I use an extra forward pass to predict the mean trajectory u.
