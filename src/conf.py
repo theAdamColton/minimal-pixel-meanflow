@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import torch
 
@@ -28,12 +27,13 @@ class MainConfig:
     num_warmup_steps: int = 40000
     lr_muon: float = 1e-3
     lr_adamw: float = 1e-4
+    max_gradient_norm: float = 0.1
     betas_adamw: tuple[float, float] = (0.9, 0.997)
     weight_decay_adamw: float = 1e-2
     weight_decay_muon: float = 1e-2
     momentum_muon: float = 0.95
 
-    perceptual_loss_proportion: float = 0.5
+    perceptual_loss_proportion: float = 0.25
 
     repa_output_size: int = 768
     repa_depth: int = 6

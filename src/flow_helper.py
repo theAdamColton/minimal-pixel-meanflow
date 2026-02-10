@@ -84,7 +84,9 @@ class FlowHelper:
         num_steps: int = 4,
     ):
         device = x_1.device
-        t = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+        dtype = x_1.dtype
+
+        t = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=dtype)
 
         x_t = x_1
 

@@ -230,6 +230,10 @@ class Trainer:
         self.ema_model.load_state_dict(self.model.state_dict())
         self.ema_model.requires_grad_(False)
 
+        # TODO
+        self.repa_projector = self.repa_projector.to(self.conf.dtype)
+        self.model = self.model.to(self.conf.dtype)
+
         self.dinov3_encoder = None
         if self.conf.repa_weight > 0:
             self.dinov3_encoder = DinoV3Encoder().to(self.conf.device, self.conf.dtype)
@@ -303,7 +307,7 @@ class Trainer:
         # ema_beta is the decay factor (close to 1.0)
         with torch.no_grad():
             for ema_p, p in zip(self.ema_model.parameters(), self.model.parameters()):
-                ema_p.lerp_(p, 1.0 - ema_beta)
+                ema_p.lerp_(p.to(ema_p.dtype), 1.0 - ema_beta)
 
     def _autocast(self):
         return torch.autocast(
@@ -329,8 +333,8 @@ class Trainer:
         npw = w // self.conf.patch_size
 
         # Create patch coordinates
-        h_coords = torch.linspace(-1.0, 1.0, nph, device=device)
-        w_coords = torch.linspace(-1.0, 1.0, npw, device=device)
+        h_coords = torch.linspace(-1.0, 1.0, nph, device=device, dtype=dtype)
+        w_coords = torch.linspace(-1.0, 1.0, npw, device=device, dtype=dtype)
         patch_coords = torch.stack(
             torch.meshgrid(h_coords, w_coords, indexing="ij"), -1
         )
@@ -350,16 +354,15 @@ class Trainer:
         labels = labels.view(-1, 1)
 
         # Forward
-        with self._autocast():
-            output: ViTDenoiserOutput = model(
-                patches=patches,
-                terminal_timesteps=r,
-                timesteps=t,
-                patch_coords=patch_coords,
-                cfg=cfg,
-                class_ids=labels,
-                return_layer_indices=return_layer_indices,
-            )
+        output: ViTDenoiserOutput = model(
+            patches=patches,
+            terminal_timesteps=r,
+            timesteps=t,
+            patch_coords=patch_coords,
+            cfg=cfg,
+            class_ids=labels,
+            return_layer_indices=return_layer_indices,
+        )
 
         # Unpatchify output
         x_0_hat = output.prediction
@@ -373,15 +376,16 @@ class Trainer:
             pw=self.conf.patch_size,
         )
 
-        return x_0_hat.float(), {"layer_hidden_states": output.layer_hidden_states}
+        # TODO
+        x_0_hat = x_0_hat.to(dtype)
+
+        return x_0_hat, {"layer_hidden_states": output.layer_hidden_states}
 
     def _compute_repa_loss(
         self, pixel_values: torch.Tensor, student_hidden_states: torch.Tensor
     ):
         _, h, w, _ = pixel_values.shape
 
-        # Compute teacher features fully in half dtype, no autocast
-        pixel_values = pixel_values.to(self.conf.dtype)
         with torch.no_grad():
             _, teacher_hidden_states = self.dinov3_encoder(pixel_values)
 
@@ -428,13 +432,12 @@ class Trainer:
         self, batch: dict[str, Any], torch_rng: torch.Generator | None = None
     ):
         device = self.conf.device
+        dtype = self.conf.dtype
 
         pixel_values = batch.pop(self.conf.dataset_image_column_name)
         labels = batch.pop(self.conf.dataset_label_column_name)
 
-        pixel_values = (
-            pixel_values.to(device, torch.float32).div_(255.0).mul_(2.0).sub_(1.0)
-        )
+        pixel_values = pixel_values.to(device, dtype).div_(255.0).mul_(2.0).sub_(1.0)
         labels = labels.to(device)
 
         # Store input shape for validation
@@ -458,39 +461,38 @@ class Trainer:
         x_0_hat = meanflow_extra_dict["x_0_hat"]
         timesteps = meanflow_extra_dict["t"]
 
-        with self._autocast():
-            repa_loss = 0.0
-            if self.conf.repa_weight > 0.0 and self.dinov3_encoder is not None:
-                # Hidden states extracted from the nth layer when computing the
-                # instantaneous velocity
-                student_hidden_states = meanflow_extra_dict[
-                    "layer_hidden_states"
-                ].squeeze(0)
-                repa_loss, extra_dict_repa = self._compute_repa_loss(
-                    pixel_values, student_hidden_states
-                )
-                extra_dict.update(extra_dict_repa)
+        repa_loss = 0.0
+        if self.conf.repa_weight > 0.0 and self.dinov3_encoder is not None:
+            # Hidden states extracted from the nth layer when computing the
+            # instantaneous velocity
+            student_hidden_states = meanflow_extra_dict["layer_hidden_states"].squeeze(
+                0
+            )
+            repa_loss, extra_dict_repa = self._compute_repa_loss(
+                pixel_values, student_hidden_states
+            )
+            extra_dict.update(extra_dict_repa)
 
-            x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
-            pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
+        x_0_hat = rearrange(x_0_hat, "b h w c -> b c h w")
+        pixel_values = rearrange(pixel_values, "b h w c -> b c h w")
 
-            # indices of the least noisy samples
-            indices = timesteps.squeeze().argsort(descending=False)
-            indices = indices[
-                : int(indices.shape[0] * self.conf.perceptual_loss_proportion)
-            ]
+        # indices of the least noisy samples
+        indices = timesteps.squeeze().argsort(descending=False)
+        indices = indices[
+            : int(indices.shape[0] * self.conf.perceptual_loss_proportion)
+        ]
 
-            # Take only the least noisy samples
-            x_0_hat = x_0_hat[indices]
-            pixel_values = pixel_values[indices]
+        # Take only the least noisy samples
+        x_0_hat = x_0_hat[indices]
+        pixel_values = pixel_values[indices]
 
-            lpips_loss = 0.0
-            if self.conf.lpips_weight > 0.0 and self.lpips_loss_fn is not None:
-                lpips_loss = self.lpips_loss_fn(x_0_hat, pixel_values)
+        lpips_loss = 0.0
+        if self.conf.lpips_weight > 0.0 and self.lpips_loss_fn is not None:
+            lpips_loss = self.lpips_loss_fn(x_0_hat, pixel_values)
 
-            convnext_loss = 0.0
-            if self.conf.convnext_weight > 0.0 and self.convnext_loss_fn is not None:
-                convnext_loss = self.convnext_loss_fn(x_0_hat, pixel_values)
+        convnext_loss = 0.0
+        if self.conf.convnext_weight > 0.0 and self.convnext_loss_fn is not None:
+            convnext_loss = self.convnext_loss_fn(x_0_hat, pixel_values)
 
         total_loss = (
             loss_dict["loss"]
@@ -522,7 +524,9 @@ class Trainer:
 
         # Gradient clipping
         for p_group in self.adamw_groups + self.muon_groups:
-            torch.nn.utils.clip_grad_norm_(p_group["params"], max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(
+                p_group["params"], max_norm=self.conf.max_gradient_norm
+            )
 
         # Update learning rates with warmup
         warmup_p = self._get_warmup_factor()
@@ -564,8 +568,10 @@ class Trainer:
     @clear_cuda_cache
     @torch.inference_mode()
     def _fast_validate(self):
+        model = self.ema_model
         device = self.conf.device
-        dtype = self.conf.dtype
+        dtype = next(iter(p for p in model.parameters() if p.is_floating_point())).dtype
+
         assert self.input_shape is not None
 
         # Generate some samples
@@ -578,12 +584,14 @@ class Trainer:
         )
         batch_size = self.input_shape[0]
         labels = torch.arange(batch_size, device=device)
-        cfg = torch.full((batch_size,), self.conf.validation_cfg, device=device)
+        cfg = torch.full(
+            (batch_size,), self.conf.validation_cfg, device=device, dtype=dtype
+        )
 
         with self._autocast():
             # Single step inference
             x_0 = self.flow_helper.sample_euler(
-                partial(self._forward_pixel_values, self.ema_model),
+                partial(self._forward_pixel_values, model),
                 x_1=x_1,
                 labels=labels,
                 cfg=cfg,
