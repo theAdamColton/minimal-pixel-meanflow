@@ -14,6 +14,8 @@ class MainConfig:
     flow: FlowHelperConfig = field(default_factory=FlowHelperConfig)
 
     dataset_path_or_url: str = "benjamin-paine/imagenet-1k-64x64"
+    dataset_image_column_name: str = "image"
+    dataset_label_column_name: str = "label"
     patch_size: int = 8
 
     batch_size: int = 256
@@ -45,6 +47,8 @@ class MainConfig:
     wandb_force_new_run: bool = True
 
     validate_every_num_steps: int = 500
+    validation_cfg: float = 2.5
+
     num_validation_batches: int = 1
     save_every_num_steps: int = 500
     max_num_checkpoints: int = 5

@@ -38,3 +38,7 @@ Before computing Convnextv2 or LPIPs I random resized crop each individual image
 
 I add an additional REPA loss in the style of iREPA (https://arxiv.org/pdf/2512.10794). Hidden states
 come from an intermediate layer from the forward pass used to compute the instantaneous velocity prediction.
+
+### Classifier-Free-Guidance
+
+The diffusion model accepts a CFG scale as an input.

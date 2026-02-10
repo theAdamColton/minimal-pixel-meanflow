@@ -181,11 +181,16 @@ class Trainer:
             return pil_to_tensor(img)
 
         def transform_row(row):
-            row["image"] = transform_img(row["image"])
+            row[self.conf.dataset_image_column_name] = transform_img(
+                row[self.conf.dataset_image_column_name]
+            )
             return row
 
         def transform_batch(samples):
-            samples["image"] = [transform_img(image) for image in samples["image"]]
+            samples[self.conf.dataset_image_column_name] = [
+                transform_img(image)
+                for image in samples[self.conf.dataset_image_column_name]
+            ]
             return samples
 
         self.train_dataset_length = len(dataset["train"])
@@ -307,16 +312,18 @@ class Trainer:
             enabled=self.conf.dtype != torch.float32,
         )
 
-    def _forward_model(
+    def _forward_pixel_values(
         self,
         model: ViTDenoiser,
         x_t: torch.Tensor,
         r: torch.Tensor,
         t: torch.Tensor,
+        cfg: torch.Tensor,
+        labels: torch.Tensor,
         return_layer_indices=None,
     ):
         """Forward pass through the model handling patching/unpatching."""
-        b, h, w, c = x_t.shape
+        b, h, w, _ = x_t.shape
         device, dtype = x_t.device, x_t.dtype
         nph = h // self.conf.patch_size
         npw = w // self.conf.patch_size
@@ -337,9 +344,10 @@ class Trainer:
             pw=self.conf.patch_size,
         )
 
-        # Prepare timesteps
-        r = r.squeeze().unsqueeze(-1)
-        t = t.squeeze().unsqueeze(-1)
+        r = r.view(-1, 1)
+        t = t.view(-1, 1)
+        cfg = cfg.view(-1, 1)
+        labels = labels.view(-1, 1)
 
         # Forward
         with self._autocast():
@@ -348,6 +356,8 @@ class Trainer:
                 terminal_timesteps=r,
                 timesteps=t,
                 patch_coords=patch_coords,
+                cfg=cfg,
+                class_ids=labels,
                 return_layer_indices=return_layer_indices,
             )
 
@@ -417,16 +427,15 @@ class Trainer:
     def _compute_losses(
         self, batch: dict[str, Any], torch_rng: torch.Generator | None = None
     ):
-        pixel_values = batch.pop("image")
+        device = self.conf.device
 
-        _, h, w, _ = pixel_values.shape
+        pixel_values = batch.pop(self.conf.dataset_image_column_name)
+        labels = batch.pop(self.conf.dataset_label_column_name)
 
         pixel_values = (
-            pixel_values.to(self.conf.device, torch.float32)
-            .div_(255.0)
-            .mul_(2.0)
-            .sub_(1.0)
+            pixel_values.to(device, torch.float32).div_(255.0).mul_(2.0).sub_(1.0)
         )
+        labels = labels.to(device)
 
         # Store input shape for validation
         self.input_shape = pixel_values.shape
@@ -435,12 +444,14 @@ class Trainer:
 
         loss_dict, meanflow_extra_dict = self.flow_helper.compute_meanflow_loss(
             x_0=pixel_values,
+            labels=labels,
             net=partial(
-                self._forward_model,
+                self._forward_pixel_values,
                 self.model,
                 return_layer_indices=[self.conf.repa_depth],
             ),
             timesteps_shape=(pixel_values.shape[0], 1, 1, 1),
+            unc_label_id=self.conf.model.unconditional_class_id,
             torch_rng=torch_rng,
         )
 
@@ -553,20 +564,29 @@ class Trainer:
     @clear_cuda_cache
     @torch.inference_mode()
     def _fast_validate(self):
+        device = self.conf.device
+        dtype = self.conf.dtype
+        assert self.input_shape is not None
+
         # Generate some samples
-        torch_rng = torch.Generator(self.conf.device)
+        torch_rng = torch.Generator(device)
         x_1 = torch.randn(
             *self.input_shape,
-            device=self.conf.device,
-            dtype=self.conf.dtype,
+            device=device,
+            dtype=dtype,
             generator=torch_rng,
         )
+        batch_size = self.input_shape[0]
+        labels = torch.arange(batch_size, device=device)
+        cfg = torch.full((batch_size,), self.conf.validation_cfg, device=device)
 
-        with torch.autocast(self.conf.device.type, self.conf.dtype):
+        with self._autocast():
             # Single step inference
             x_0 = self.flow_helper.sample_euler(
-                partial(self._forward_model, self.ema_model),
+                partial(self._forward_pixel_values, self.ema_model),
                 x_1=x_1,
+                labels=labels,
+                cfg=cfg,
                 num_steps=1,
             )
 
@@ -680,7 +700,7 @@ class Trainer:
         data_iter = iter(self.train_loader)
         while True:
             batch = next(data_iter)
-            num_batch_samples = len(batch["image"])
+            num_batch_samples = len(batch[self.conf.dataset_image_column_name])
             log_dict = self._train_step(batch)
 
             log_dict["epoch"] = self.num_trained_samples / self.train_dataset_length

@@ -423,6 +423,9 @@ class ViTDenoiser(nn.Module):
         self.timestep_embedder = TimestepEmbedder(
             conf.hidden_size, timestep_frequency_embedding_size
         )
+        self.cfg_embedder = TimestepEmbedder(
+            conf.hidden_size, timestep_frequency_embedding_size
+        )
 
         self.class_embedding = nn.Parameter(
             torch.empty(conf.num_classes, conf.hidden_size)
@@ -473,6 +476,7 @@ class ViTDenoiser(nn.Module):
         terminal_timesteps: torch.Tensor | None = None,
         timesteps: torch.Tensor,
         patch_coords: torch.Tensor,
+        cfg: torch.Tensor,
         class_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         return_layer_indices: list[int] | None = None,
@@ -482,6 +486,7 @@ class ViTDenoiser(nn.Module):
         patches: b l d_patch
         timesteps: b/1 l/1
         patch_coords: b/1 l 2
+        cfg: b/1 l/1
         class_ids: b/1 l/1
         attention_mask: b/1 l s
         """
@@ -499,10 +504,11 @@ class ViTDenoiser(nn.Module):
             terminal_timesteps = torch.zeros_like(timesteps)
         condition = condition + self.terminal_timestep_embedder(terminal_timesteps)
 
+        condition = condition + self.cfg_embedder(cfg)
+
         if class_ids is None:
-            class_embedding = self.class_embedding[conf.unconditional_class_id][
-                None, None
-            ]
+            class_embedding = self.class_embedding[conf.unconditional_class_id]
+            class_embedding = unsqueeze_leading(class_embedding, condition)
         else:
             class_embedding = self.class_embedding[class_ids]
 
