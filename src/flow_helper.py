@@ -209,17 +209,17 @@ class FlowHelper:
         )
         loss_u = self.adaptive_weighting(loss_u_raw).mean()
 
-        # Instantaneous Loss (Auxiliary Flow Matching)
-        # This is required to ensure v_inst (used in JVP) is accurate
-        #
-        # Note that this loss is not mentioned in the paper but is
-        # in the official Mean-flow and Improved-Mean-flow code
-        loss_v_raw = F.mse_loss(v_hat_guided, v_target.detach(), reduction="none").mean(
-            dim=(1, 2, 3)
-        )
-        loss_v = self.adaptive_weighting(loss_v_raw).mean()
+        # # Instantaneous Loss (Auxiliary Flow Matching)
+        # # This is required to ensure v_inst (used in JVP) is accurate
+        # #
+        # # Note that this loss is not mentioned in the paper but is
+        # # in the official Mean-flow and Improved-Mean-flow code
+        # loss_v_raw = F.mse_loss(v_hat_guided, v_target.detach(), reduction="none").mean(
+        #     dim=(1, 2, 3)
+        # )
+        # loss_v = self.adaptive_weighting(loss_v_raw).mean()
 
-        total_loss = loss_u + loss_v
+        total_loss = loss_u  # + loss_v
 
         # Equation (8) of Pixel Meanflow
         x_0_hat = x_t - u * t
@@ -228,7 +228,7 @@ class FlowHelper:
             {
                 "loss": total_loss,
                 "loss_mf": loss_u,
-                "loss_fm": loss_v,
+                # "loss_fm": loss_v,
             },
             {"x_0_hat": x_0_hat, "r": r, "t": t, **supplemental_outputs},
         )
