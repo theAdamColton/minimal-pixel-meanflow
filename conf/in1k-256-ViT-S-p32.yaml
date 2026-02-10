@@ -6,16 +6,16 @@ conf:
     num_attention_heads: 6
     num_blocks: 12
     should_pin_adaln: true
+    num_classes: 1024
+    unconditional_class_id: 1023
   flow:
     time_shift_dim: 196608
     time_shift_base: 4096
     eps: 0.001
     prediction_mode: clean_input
-    norm_p: 1.0
-    norm_eps: 0.01
   dataset_path_or_url: benjamin-paine/imagenet-1k-256x256
   patch_size: 32
-  batch_size: 64
+  batch_size: 128
   num_workers: 8
   num_train_epochs: 1000
   ema_beta: 0.9995

@@ -388,6 +388,9 @@ class ViTDenoiserConfig:
     num_blocks: int = 12
     should_pin_adaln: bool = True
 
+    num_classes: int = 1024
+    unconditional_class_id: int = 1023
+
 
 class ViTDenoiserOutput(NamedTuple):
     prediction: torch.Tensor
@@ -421,6 +424,10 @@ class ViTDenoiser(nn.Module):
             conf.hidden_size, timestep_frequency_embedding_size
         )
 
+        self.class_embedding = nn.Parameter(
+            torch.empty(conf.num_classes, conf.hidden_size)
+        )
+
         self.rotary_embeds = Rope2DPositionEmbedding(head_dim=conf.head_dim)
 
         self.blocks = nn.ModuleList(
@@ -448,6 +455,8 @@ class ViTDenoiser(nn.Module):
             torch_rng=torch_rng,
         )
 
+        init.trunc_normal_(self.class_embedding, std=init_std, generator=torch_rng)
+
         if self.conf.should_pin_adaln:
             adaln_modulation_0 = self.blocks[0].adaLN_modulation
             for block in self.blocks:
@@ -464,6 +473,7 @@ class ViTDenoiser(nn.Module):
         terminal_timesteps: torch.Tensor | None = None,
         timesteps: torch.Tensor,
         patch_coords: torch.Tensor,
+        class_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         return_layer_indices: list[int] | None = None,
     ):
@@ -472,6 +482,7 @@ class ViTDenoiser(nn.Module):
         patches: b l d_patch
         timesteps: b/1 l/1
         patch_coords: b/1 l 2
+        class_ids: b/1 l/1
         attention_mask: b/1 l s
         """
 
@@ -487,6 +498,16 @@ class ViTDenoiser(nn.Module):
         if terminal_timesteps is None:
             terminal_timesteps = torch.zeros_like(timesteps)
         condition = condition + self.terminal_timestep_embedder(terminal_timesteps)
+
+        if class_ids is None:
+            class_embedding = self.class_embedding[conf.unconditional_class_id][
+                None, None
+            ]
+        else:
+            class_embedding = self.class_embedding[class_ids]
+
+        condition = condition + class_embedding
+
         condition = F.silu(condition)
 
         projected_condition = None

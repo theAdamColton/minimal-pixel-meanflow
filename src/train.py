@@ -300,6 +300,13 @@ class Trainer:
             for ema_p, p in zip(self.ema_model.parameters(), self.model.parameters()):
                 ema_p.lerp_(p, 1.0 - ema_beta)
 
+    def _autocast(self):
+        return torch.autocast(
+            self.conf.device.type,
+            self.conf.dtype,
+            enabled=self.conf.dtype != torch.float32,
+        )
+
     def _forward_model(
         self,
         model: ViTDenoiser,
@@ -335,11 +342,7 @@ class Trainer:
         t = t.squeeze().unsqueeze(-1)
 
         # Forward
-        with torch.autocast(
-            self.conf.device.type,
-            self.conf.dtype,
-            enabled=patches.dtype != torch.float32,
-        ):
+        with self._autocast():
             output: ViTDenoiserOutput = model(
                 patches=patches,
                 terminal_timesteps=r,
@@ -444,11 +447,7 @@ class Trainer:
         x_0_hat = meanflow_extra_dict["x_0_hat"]
         timesteps = meanflow_extra_dict["t"]
 
-        with torch.autocast(
-            self.conf.device.type,
-            self.conf.dtype,
-            enabled=self.conf.dtype != torch.float32,
-        ):
+        with self._autocast():
             repa_loss = 0.0
             if self.conf.repa_weight > 0.0 and self.dinov3_encoder is not None:
                 # Hidden states extracted from the nth layer when computing the
