@@ -428,7 +428,7 @@ class ViTDenoiser(nn.Module):
         )
 
         self.class_embedding = nn.Parameter(
-            torch.empty(conf.num_classes, conf.hidden_size)
+            torch.zeros(conf.num_classes, conf.hidden_size)
         )
 
         self.rotary_embeds = Rope2DPositionEmbedding(head_dim=conf.head_dim)
@@ -523,7 +523,7 @@ class ViTDenoiser(nn.Module):
 
         layer_hidden_states = None
         if return_layer_indices is not None:
-            layer_hidden_states = torch.empty(
+            layer_hidden_states = torch.zeros(
                 len(return_layer_indices),
                 b,
                 s,

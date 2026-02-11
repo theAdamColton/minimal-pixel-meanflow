@@ -7,6 +7,8 @@ that uses pytorch.
 
 Requires [uv](https://docs.astral.sh/uv/`)
 
+You can find the official JAX implementation [Here](https://github.com/Lyy-iiis/pMF)
+
 # Train a model
 
 `uv run main.py --conf.should_compile true --conf.dtype_str bfloat16 --conf.device_str cuda train`
@@ -25,6 +27,8 @@ Here is what the generated samples look like after 54 epochs:
 
 I use DerfNorm, Box-RoPE-2d which is similar to dinov3, and QK normalization. Note that ALL Normalization layers
 were replaced with DerfNorm.
+
+Unlike the official implementation, I do not use an auxiliary v-prediction head.
 
 ### Perceptual losses
 

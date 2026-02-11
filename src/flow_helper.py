@@ -24,7 +24,7 @@ class FlowHelperConfig:
     prediction_mode: Literal["clean_input", "velocity"] = "clean_input"
 
     # This proportion of each batch will
-    # have instantaneous v-pred loss
+    # have instantaneous v-prediction
     instantaneous_velocity_proportion: float = 0.5
 
     uncondition_rate: float = 0.1
@@ -52,17 +52,14 @@ class FlowHelper:
         t = 1 - (1 - t) / (1 - t + shift * t)
         return t
 
-    def get_velocity(
+    def convert_to_velocity(
         self, model_out: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor
     ) -> torch.Tensor:
         """
         Converts model output to velocity u based on prediction mode.
         """
         if self.conf.prediction_mode == "clean_input":
-            t_clipped = t.clamp(min=self.conf.eps)
-            with torch.autocast(model_out.device.type, enabled=False):
-                u = (x_t.float() - model_out.float()) / t_clipped.float()
-            u = u.to(model_out.dtype)
+            u = (x_t - model_out) / t.clip(self.conf.eps)
         elif self.conf.prediction_mode == "velocity":
             u = model_out
         else:
@@ -103,10 +100,11 @@ class FlowHelper:
             model_out, _ = net(x_t, r_in, t_in, cfg, labels)
 
             if self.conf.prediction_mode == "clean_input" and num_steps == 1:
+                # skip velocity conversion and
                 # simply return the direct single-step output
                 return model_out
 
-            u = self.get_velocity(model_out, x_t, t_in)
+            u = self.convert_to_velocity(model_out, x_t, t_in)
 
             x_t = x_t + u * dt
 
@@ -150,9 +148,9 @@ class FlowHelper:
         r = masked_fill(flow_matching_mask, t, r)
 
         # Sample CFG scale
-        cfg_scale = torch.rand(
+        cfg_scale = self.conf.max_cfg_scale ** torch.rand(
             timesteps_shape, generator=torch_rng, device=device, dtype=dtype
-        ).pow(self.conf.max_cfg_scale)
+        )
 
         # Disable CFG when the timestep is outside the cfg interval
         cfg_min_timestep, cfg_max_timestep = conf.cfg_interval
@@ -160,23 +158,29 @@ class FlowHelper:
             (t < cfg_min_timestep) | (cfg_max_timestep < t), 1.0
         )
 
-        unconditional_labels = torch.full_like(labels, unc_label_id)
-
         x_1 = torch.randn_like(x_0)
 
         x_t = (1 - t) * x_0 + t * x_1
 
         # Target instantaneous velocity
-        v = x_1 - x_0
+        v_t = (x_t - x_0) / t.clip(self.conf.eps)
 
         with torch.no_grad():
+            unconditional_labels = torch.full_like(labels, unc_label_id)
+            pred, _ = net(
+                torch.cat((x_t, x_t)),
+                torch.cat((t, t)),
+                torch.cat((t, t)),
+                torch.cat((cfg_scale, cfg_scale)),
+                torch.cat((labels, unconditional_labels)),
+            )
+            v_t_hat_cond_unc = self.convert_to_velocity(
+                pred, torch.cat((x_t, x_t)), torch.cat((t, t))
+            )
+            v_t_hat_cond, v_t_hat_unc = v_t_hat_cond_unc.chunk(2)
+
             # Predicted instantaneous velocity using cfg
-            # TODO make this batched
-            pred_inst_cond, _ = net(x_t, t, t, cfg_scale, labels)
-            v_hat_cond = self.get_velocity(pred_inst_cond, x_t, t)
-            pred_inst_unc, _ = net(x_t, t, t, cfg_scale, unconditional_labels)
-            v_hat_unc = self.get_velocity(pred_inst_unc, x_t, t)
-            v_hat_guided = v + (1 - 1 / cfg_scale) * (v_hat_cond - v_hat_unc)
+            v_t_hat_guided = v_t + (1 - 1 / cfg_scale) * (v_t_hat_cond - v_t_hat_unc)
 
             # Drop labels randomly
             uncondition_mask = (
@@ -188,7 +192,7 @@ class FlowHelper:
             labels = labels.masked_fill(uncondition_mask, unc_label_id)
             # Predict unguided velocity when labels are absent
             v_target = masked_fill(
-                unsqueeze_trailing(uncondition_mask, v), v, v_hat_guided
+                unsqueeze_trailing(uncondition_mask, v_t), v_t, v_t_hat_guided
             )
 
             # JVP Calculation for Mean Flow
@@ -199,7 +203,7 @@ class FlowHelper:
 
             def u_wrapper(x_in, r_in, t_in):
                 out, _ = net(x_in, r_in, t_in, cfg_scale, labels)
-                return self.get_velocity(out, x_in, t_in)
+                return self.convert_to_velocity(out, x_in, t_in)
 
             # TODO, The paper and the official iMF compute the trajectory u,
             # and dudt in a single call to jvp. However, jvp doesn't
@@ -218,11 +222,11 @@ class FlowHelper:
             zeros_like_r = torch.zeros_like(r)
             ones_like_t = torch.ones_like(t)
             _, dudt = torch.func.jvp(
-                u_wrapper, (x_t, r, t), (v_hat_cond, zeros_like_r, ones_like_t)
+                u_wrapper, (x_t, r, t), (v_t_hat_cond, zeros_like_r, ones_like_t)
             )
 
         prediction, supplemental_outputs = net(x_t, r, t, cfg_scale, labels)
-        u = self.get_velocity(prediction, x_t, t)
+        u = self.convert_to_velocity(prediction, x_t, t)
 
         # Equation (7) of Pixel Meanflow
         # Construct Compound Vector Field V
@@ -246,10 +250,12 @@ class FlowHelper:
         #     dim=(1, 2, 3)
         # )
         # loss_v = self.adaptive_weighting(loss_v_raw).mean()
+        #
 
         total_loss = loss_u  # + loss_v
 
         # Equation (8) of Pixel Meanflow
+        # (Assuming r=0)
         x_0_hat = x_t - u * t
 
         return (

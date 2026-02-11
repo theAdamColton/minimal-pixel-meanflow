@@ -351,16 +351,17 @@ class Trainer:
         cfg = cfg.view(-1, 1)
         labels = labels.view(-1, 1)
 
-        # Forward
-        output: ViTDenoiserOutput = model(
-            patches=patches,
-            terminal_timesteps=r,
-            timesteps=t,
-            patch_coords=patch_coords,
-            cfg=cfg,
-            class_ids=labels,
-            return_layer_indices=return_layer_indices,
-        )
+        with self._autocast():
+            # Forward
+            output: ViTDenoiserOutput = model(
+                patches=patches,
+                terminal_timesteps=r,
+                timesteps=t,
+                patch_coords=patch_coords,
+                cfg=cfg,
+                class_ids=labels,
+                return_layer_indices=return_layer_indices,
+            )
 
         # Unpatchify output
         x_0_hat = output.prediction
@@ -374,7 +375,7 @@ class Trainer:
             pw=self.conf.patch_size,
         )
 
-        x_0_hat = x_0_hat.to(dtype)
+        x_0_hat = x_0_hat.to(torch.float32)
 
         return x_0_hat, {"layer_hidden_states": output.layer_hidden_states}
 
@@ -383,8 +384,9 @@ class Trainer:
     ):
         _, h, w, _ = pixel_values.shape
 
-        with torch.no_grad():
-            _, teacher_hidden_states = self.dinov3_encoder(pixel_values)
+        with self._autocast():
+            with torch.no_grad():
+                _, teacher_hidden_states = self.dinov3_encoder(pixel_values)
 
         teacher_hidden_states = rearrange(
             teacher_hidden_states,
@@ -487,11 +489,13 @@ class Trainer:
 
         lpips_loss = 0.0
         if self.conf.lpips_weight > 0.0 and self.lpips_loss_fn is not None:
-            lpips_loss = self.lpips_loss_fn(x_0_hat, pixel_values)
+            with self._autocast():
+                lpips_loss = self.lpips_loss_fn(x_0_hat, pixel_values)
 
         convnext_loss = 0.0
         if self.conf.convnext_weight > 0.0 and self.convnext_loss_fn is not None:
-            convnext_loss = self.convnext_loss_fn(x_0_hat, pixel_values)
+            with self._autocast():
+                convnext_loss = self.convnext_loss_fn(x_0_hat, pixel_values)
 
         total_loss = (
             loss_dict["loss"]
@@ -511,10 +515,11 @@ class Trainer:
 
     def _train_step(self, batch: dict[str, Any]) -> dict[str, float]:
         """Execute a single training step."""
-        with self._autocast():
-            loss_dict, _ = self._compute_losses_training(batch)
+        loss_dict, _ = self._compute_losses_training(batch)
 
         total_loss = loss_dict["total_loss"]
+        if total_loss.isnan():
+            raise ValueError()
         total_loss.backward()
 
         loss_dict = {
@@ -559,6 +564,7 @@ class Trainer:
 
         log_dict = {
             **loss_dict,
+            "ema_beta": ema_beta,
             "lr_adamw": lr_adamw,
             "lr_muon": lr_muon,
         }

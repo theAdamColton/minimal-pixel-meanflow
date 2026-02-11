@@ -224,6 +224,10 @@ class ConvNextV2Loss(nn.Module):
             network after VAE decoding. The perceptual distance is
             computed using the extracted features, excluding the final
             classification head.
+
+        TODO
+        In the pMF official code they only use the average-pooled features from the very last
+        layer of the ConvNext model, and compare using MSE distance
         """
         # Expects [B, C, H, W] in (-1,1)
         b, _, h, w = pixel_values_real.shape
@@ -248,9 +252,7 @@ class ConvNextV2Loss(nn.Module):
 
             if i in self.feature_indices:
                 hidden_states_synth, hidden_states_real = hidden_states.chunk(2, dim=0)
-                layer_loss = -F.cosine_similarity(
-                    hidden_states_synth, hidden_states_real
-                ).mean()
+                layer_loss = F.mse_loss(hidden_states_synth, hidden_states_real)
                 loss += layer_loss / len(self.feature_indices)
 
         return loss
