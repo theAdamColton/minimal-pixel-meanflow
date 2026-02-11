@@ -477,7 +477,7 @@ class ViTDenoiser(nn.Module):
         timesteps: torch.Tensor,
         patch_coords: torch.Tensor,
         cfg: torch.Tensor,
-        class_ids: torch.Tensor | None = None,
+        class_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_layer_indices: list[int] | None = None,
     ):
@@ -506,11 +506,7 @@ class ViTDenoiser(nn.Module):
 
         condition = condition + self.cfg_embedder(cfg)
 
-        if class_ids is None:
-            class_embedding = self.class_embedding[conf.unconditional_class_id]
-            class_embedding = unsqueeze_leading(class_embedding, condition)
-        else:
-            class_embedding = self.class_embedding[class_ids]
+        class_embedding = self.class_embedding[class_ids]
 
         condition = condition + class_embedding
 

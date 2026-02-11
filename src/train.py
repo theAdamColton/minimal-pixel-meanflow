@@ -197,6 +197,8 @@ class Trainer:
 
         train_dataset = (
             dataset["train"]
+            .shuffle(seed=42)
+            .flatten_indices()
             .to_iterable_dataset(num_shards=1024)
             .repeat(None)
             .shuffle()

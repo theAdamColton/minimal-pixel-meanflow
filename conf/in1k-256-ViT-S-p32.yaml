@@ -11,7 +11,8 @@ conf:
   flow:
     time_shift_dim: 196608
     time_shift_base: 4096
-    eps: 0.05
+    eps: 5e-2
+    max_cfg_scale: 6.0
     prediction_mode: clean_input
   dataset_path_or_url: benjamin-paine/imagenet-1k-256x256
   patch_size: 32

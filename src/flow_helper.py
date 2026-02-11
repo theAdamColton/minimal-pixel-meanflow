@@ -28,7 +28,7 @@ class FlowHelperConfig:
     instantaneous_velocity_proportion: float = 0.5
 
     uncondition_rate: float = 0.1
-    max_cfg_scale: float = 7.0
+    max_cfg_scale: float = 6.0
     # Enable CFG guidance only when timesteps are in this range
     cfg_interval: tuple[float, float] = (0.1, 0.7)
 
@@ -171,6 +171,10 @@ class FlowHelper:
             v_hat_unc = self.get_velocity(pred_inst_unc, x_t, t)
             v_hat_guided = v + (1 - 1 / cfg_scale) * (v_hat_cond - v_hat_unc)
 
+            # TODO
+            # try to fix NaNs
+            v_hat_guided = v_hat_guided.clip(-20, 20)
+
             # Drop labels randomly
             uncondition_mask = (
                 torch.rand(
@@ -179,7 +183,7 @@ class FlowHelper:
                 < conf.uncondition_rate
             )
             labels = labels.masked_fill(uncondition_mask, unc_label_id)
-            # Predict unguided velocity/trajectory when labels are absent
+            # Predict unguided velocity when labels are absent
             v_target = masked_fill(
                 unsqueeze_trailing(uncondition_mask, v), v, v_hat_guided
             )
@@ -208,6 +212,10 @@ class FlowHelper:
             _, dudt = torch.func.jvp(
                 u_wrapper, (x_t, r, t), (v_hat_cond, zeros_like_r, ones_like_t)
             )
+
+            # TODO
+            # try to fix NaNs
+            dudt = dudt.clip(-20, 20)
 
         prediction, supplemental_outputs = net(x_t, r, t, cfg_scale, labels)
         u = self.get_velocity(prediction, x_t, t)
