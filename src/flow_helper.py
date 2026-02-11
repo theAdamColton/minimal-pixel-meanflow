@@ -60,7 +60,9 @@ class FlowHelper:
         """
         if self.conf.prediction_mode == "clean_input":
             t_clipped = t.clamp(min=self.conf.eps)
-            u = (x_t - model_out) / t_clipped
+            with torch.autocast(model_out.device.type, enabled=False):
+                u = (x_t.float() - model_out.float()) / t_clipped.float()
+            u = u.to(model_out.dtype)
         elif self.conf.prediction_mode == "velocity":
             u = model_out
         else:
@@ -99,6 +101,11 @@ class FlowHelper:
             r_in = unsqueeze_trailing(t_next, x_t)
 
             model_out, _ = net(x_t, r_in, t_in, cfg, labels)
+
+            if self.conf.prediction_mode == "clean_input" and num_steps == 1:
+                # simply return the direct single-step output
+                return model_out
+
             u = self.get_velocity(model_out, x_t, t_in)
 
             x_t = x_t + u * dt
@@ -171,10 +178,6 @@ class FlowHelper:
             v_hat_unc = self.get_velocity(pred_inst_unc, x_t, t)
             v_hat_guided = v + (1 - 1 / cfg_scale) * (v_hat_cond - v_hat_unc)
 
-            # TODO
-            # try to fix NaNs
-            v_hat_guided = v_hat_guided.clip(-20, 20)
-
             # Drop labels randomly
             uncondition_mask = (
                 torch.rand(
@@ -206,16 +209,17 @@ class FlowHelper:
             # TODO there is a discrepancy between pixel-mean-flow's
             # alogorithm 2, and improved-mean-flow's code. I follow the code's
             # implementation and use the conditioned velocity as the jvp tangents
+            #
+            # Another difference is that iMF's code evaluates the tanget using
+            # the labels and the cfg scale, but the algorithm indicates that
+            # the tangent is evaluated with `0.0` for CFG and null label.
+            # I follow the iMF code and use the cfg and label.
 
             zeros_like_r = torch.zeros_like(r)
             ones_like_t = torch.ones_like(t)
             _, dudt = torch.func.jvp(
                 u_wrapper, (x_t, r, t), (v_hat_cond, zeros_like_r, ones_like_t)
             )
-
-            # TODO
-            # try to fix NaNs
-            dudt = dudt.clip(-20, 20)
 
         prediction, supplemental_outputs = net(x_t, r, t, cfg_scale, labels)
         u = self.get_velocity(prediction, x_t, t)

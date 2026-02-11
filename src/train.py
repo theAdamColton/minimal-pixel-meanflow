@@ -201,7 +201,7 @@ class Trainer:
             .flatten_indices()
             .to_iterable_dataset(num_shards=1024)
             .repeat(None)
-            .shuffle()
+            .shuffle(buffer_size=4096)
             .map(transform_row)
         )
 
