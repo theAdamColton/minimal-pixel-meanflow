@@ -17,6 +17,12 @@ This command trains a ViT-S with a patch size of 32 on imagenet1k 256x256 for 50
 
 Intermediate generations are saved to `out/.../artifacts/`
 
+Here are some single-step generations after 720k steps / 36 epochs, with a CFG of 2.5
+
+<img width="2062" height="2062" alt="image" src="https://github.com/user-attachments/assets/43cc2f5c-6992-43de-9f87-0fb91e1565a5" />
+
+
+
 # Implementation Details
 
 ### Complexity
