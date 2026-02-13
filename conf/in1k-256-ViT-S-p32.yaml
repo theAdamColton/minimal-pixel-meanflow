@@ -19,7 +19,7 @@ conf:
   batch_size: 64
   num_workers: 8
   num_train_epochs: 1000
-  ema_beta: 0.9995
+  ema_beta: 0.9999
   num_warmup_steps: 40000
   lr_muon: 1e-4
   lr_adamw: 7e-5
