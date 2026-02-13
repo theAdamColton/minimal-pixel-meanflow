@@ -7,26 +7,34 @@ that uses pytorch.
 
 Requires [uv](https://docs.astral.sh/uv/`)
 
-You can find the official JAX implementation [Here](https://github.com/Lyy-iiis/pMF)
+You can find the official implementation [Here](https://github.com/Lyy-iiis/pMF)
 
 # Train a model
 
-`uv run main.py --conf.should_compile true --conf.dtype_str bfloat16 --conf.device_str cuda train`
+This command trains a ViT-S with a patch size of 32 on imagenet1k 256x256 for 500 epochs and requires 8 GB of device memory.
 
-This trains a mini ViT with a patch size of 8 on imagenet1k 64x64 for 1000 epochs.
-This requires 16 GB of gpu memory and an nvidia gpu.
-Intermediate generation outputs are saved in out/..../artifacts.
+`uv run main.py --config conf/in1k-256-ViT-S-p32.yaml --conf.should_compile true train`
 
-Here is what the generated samples look like after 54 epochs:
-
-<img width="1054" height="1054" alt="272500" src="https://github.com/user-attachments/assets/2fbd0655-7c6d-43a5-953c-ea32aab157ac" />
+Intermediate generations are saved to `out/.../artifacts/`
 
 # Implementation Details
 
+### Complexity
+
+During each training step the model is forwarded four times without gradients and one time with
+gradients.
+
+A forward passes with 2 x batch size computes the guided instantaneous velocity without gradients.
+Another two forward passes without gradients to compute the meanflow JVP. The final forward
+pass computes the predicted mean flow with gradients enabled.
+
+During test time only one forward pass is necessary for guided generation.
+
 ### Transformer
 
-I use DerfNorm, Box-RoPE-2d which is similar to dinov3, and QK normalization. Note that ALL Normalization layers
-were replaced with DerfNorm.
+I use DerfNorm, Box-RoPE-2d which is similar to dinov3, and QK normalization. Note that ALL Normalization layers are replaced with DerfNorm.
+
+By default I pin all adaLN projections - the model reuses the same adaLN projection for all layers.
 
 Unlike the official implementation, I do not use an auxiliary v-prediction head.
 
@@ -43,11 +51,19 @@ Before computing Convnextv2 or LPIPs I random resized crop each individual image
 I add an additional REPA loss in the style of iREPA (https://arxiv.org/pdf/2512.10794). Hidden states
 come from an intermediate layer from the forward pass used to compute the instantaneous velocity prediction.
 
+### REPA loss
+
+A conv2d uses hidden states from the model's 6th layer to predict dinov3 states. pMF does not use REPA but I assume that REPA can speed up convergence for pMF models.
+
 ### Classifier-Free-Guidance
 
-The diffusion model accepts a CFG scale as an input. During training it estimates the guided velocity and mean trajectory. Unlike iMF and pMF I do not use CFG interval as a model input and instead only apply CFG to samples that are noised within some CFG interval (by default 0.1 to 0.7]).
+The diffusion model accepts a CFG scale as an input. Unlike traditional CFG, you do not need to
+do two forward passes to guide sampling.
+
+Unlike iMF and pMF I do not use the CFG interval as a model input.
+Instead I only apply CFG to samples that are noised within some CFG interval (by default 0.1 to 0.7]). This reduces the number of forward passes by 1 compared to the iMF code.
 
 ### Floating Point Precision and JVP
 
-I couldn't seem to figure out how to use torch's autocast when using JVP.
-So I use an extra forward pass to predict the mean trajectory u.
+I couldn't seem to figure out how to use torch's autocast when using JVP with gradients enabled.
+So I compute JVP inside of a no_grad context and use an extra forward pass to predict the mean trajectory u.
